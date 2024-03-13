@@ -34,8 +34,7 @@
 void RegisterCustomObjects(int /*argc*/, char** /*argv*/) {}
 #endif
 
-namespace ROCKSDB_NAMESPACE {
-namespace test {
+namespace ROCKSDB_NAMESPACE::test {
 
 const uint32_t kDefaultFormatVersion = BlockBasedTableOptions().format_version;
 const std::set<uint32_t> kFooterFormatVersionsToTest{
@@ -370,6 +369,7 @@ void RandomInitCFOptions(ColumnFamilyOptions* cf_opt, DBOptions& db_options,
   cf_opt->memtable_whole_key_filtering = rnd->Uniform(2);
   cf_opt->enable_blob_files = rnd->Uniform(2);
   cf_opt->enable_blob_garbage_collection = rnd->Uniform(2);
+  cf_opt->strict_max_successive_merges = rnd->Uniform(2);
 
   // double options
   cf_opt->memtable_prefix_bloom_size_ratio =
@@ -748,5 +748,4 @@ void RegisterTestLibrary(const std::string& arg) {
     ObjectRegistry::Default()->AddLibrary("test", RegisterTestObjects, arg);
   }
 }
-}  // namespace test
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::test

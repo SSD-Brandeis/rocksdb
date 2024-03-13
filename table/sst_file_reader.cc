@@ -81,12 +81,11 @@ Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
                       ? roptions.snapshot->GetSequenceNumber()
                       : kMaxSequenceNumber;
   ArenaWrappedDBIter* res = new ArenaWrappedDBIter();
-  res->Init(r->options.env, roptions, r->ioptions, r->moptions,
-            nullptr /* version */, sequence,
-            r->moptions.max_sequential_skip_in_iterations,
-            0 /* version_number */, nullptr /* read_callback */,
-            nullptr /* db_impl */, nullptr /* cfd */,
-            true /* expose_blob_index */, false /* allow_refresh */);
+  res->Init(
+      r->options.env, roptions, r->ioptions, r->moptions, nullptr /* version */,
+      sequence, r->moptions.max_sequential_skip_in_iterations,
+      0 /* version_number */, nullptr /* read_callback */, nullptr /* cfh */,
+      true /* expose_blob_index */, false /* allow_refresh */);
   auto internal_iter = r->table_reader->NewIterator(
       res->GetReadOptions(), r->moptions.prefix_extractor.get(),
       res->GetArena(), false /* skip_filters */,
@@ -104,6 +103,42 @@ Status SstFileReader::VerifyChecksum(const ReadOptions& read_options) {
   assert(read_options.io_activity == Env::IOActivity::kUnknown);
   return rep_->table_reader->VerifyChecksum(read_options,
                                             TableReaderCaller::kSSTFileReader);
+}
+
+Status SstFileReader::VerifyNumEntries(const ReadOptions& read_options) {
+  Rep* r = rep_.get();
+  std::unique_ptr<InternalIterator> internal_iter{r->table_reader->NewIterator(
+      read_options, r->moptions.prefix_extractor.get(), nullptr,
+      false /* skip_filters */, TableReaderCaller::kSSTFileReader)};
+  internal_iter->SeekToFirst();
+  Status s = internal_iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  uint64_t num_read = 0;
+  for (; internal_iter->Valid(); internal_iter->Next()) {
+    ++num_read;
+  };
+  s = internal_iter->status();
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<const TableProperties> tp = GetTableProperties();
+  if (!tp) {
+    s = Status::Corruption("table properties not available");
+  } else {
+    // TODO: verify num_range_deletions
+    uint64_t expected = tp->num_entries - tp->num_range_deletions;
+    if (num_read != expected) {
+      std::ostringstream oss;
+      oss << "Table property expects " << expected
+          << " entries when excluding range deletions,"
+          << " but scanning the table returned " << std::to_string(num_read)
+          << " entries";
+      s = Status::Corruption(oss.str());
+    }
+  }
+  return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -431,7 +431,7 @@ class SstFileReaderTimestampNotPersistedTest
     sst_name_ = test::PerThreadDBPath("sst_file_ts_not_persisted");
   }
 
-  ~SstFileReaderTimestampNotPersistedTest() {}
+  ~SstFileReaderTimestampNotPersistedTest() = default;
 };
 
 TEST_F(SstFileReaderTimestampNotPersistedTest, Basic) {
@@ -525,6 +525,57 @@ TEST_F(SstFileReaderTimestampNotPersistedTest, IncompatibleTimestampFormat) {
                   .DeleteRange("begin_key_timestamp_absent",
                                "end_key_with_a_complete_lack_of_timestamps")
                   .IsInvalidArgument());
+}
+
+TEST_F(SstFileReaderTest, VerifyNumEntriesBasic) {
+  std::vector<std::string> keys;
+  for (uint64_t i = 0; i < kNumKeys; i++) {
+    keys.emplace_back(EncodeAsUint64(i));
+  }
+  CreateFile(sst_name_, keys);
+  SstFileReader reader(options_);
+  ASSERT_OK(reader.Open(sst_name_));
+  ASSERT_OK(reader.VerifyNumEntries(ReadOptions()));
+}
+
+TEST_F(SstFileReaderTest, VerifyNumEntriesDeleteRange) {
+  SstFileWriter writer(soptions_, options_);
+  ASSERT_OK(writer.Open(sst_name_));
+
+  for (uint64_t i = 0; i < kNumKeys; i++) {
+    ASSERT_OK(writer.Put(EncodeAsUint64(i), EncodeAsUint64(i + 1)));
+  }
+  ASSERT_OK(
+      writer.DeleteRange(EncodeAsUint64(0), EncodeAsUint64(kNumKeys / 2)));
+  ASSERT_OK(writer.Finish());
+  SstFileReader reader(options_);
+  ASSERT_OK(reader.Open(sst_name_));
+  ASSERT_OK(reader.VerifyNumEntries(ReadOptions()));
+}
+
+TEST_F(SstFileReaderTest, VerifyNumEntriesCorruption) {
+  const int num_keys = 99;
+  const int corrupted_num_keys = num_keys + 2;
+  SyncPoint::GetInstance()->SetCallBack(
+      "PropertyBlockBuilder::AddTableProperty:Start", [&](void* arg) {
+        TableProperties* props = reinterpret_cast<TableProperties*>(arg);
+        props->num_entries = corrupted_num_keys;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  std::vector<std::string> keys;
+  for (uint64_t i = 0; i < num_keys; i++) {
+    keys.emplace_back(EncodeAsUint64(i));
+  }
+  CreateFile(sst_name_, keys);
+  SstFileReader reader(options_);
+  ASSERT_OK(reader.Open(sst_name_));
+  Status s = reader.VerifyNumEntries(ReadOptions());
+  ASSERT_TRUE(s.IsCorruption());
+  std::ostringstream oss;
+  oss << "Table property expects " << corrupted_num_keys
+      << " entries when excluding range deletions,"
+      << " but scanning the table returned " << num_keys << " entries";
+  ASSERT_TRUE(std::strstr(oss.str().c_str(), s.getState()));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

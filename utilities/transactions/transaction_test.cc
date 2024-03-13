@@ -250,6 +250,42 @@ TEST_P(TransactionTest, SuccessTest) {
   delete txn;
 }
 
+// Test the basic API of the pinnable slice overload of GetForUpdate()
+TEST_P(TransactionTest, SuccessTestPinnable) {
+  ASSERT_OK(db->ResetStats());
+
+  WriteOptions write_options;
+  ReadOptions read_options;
+  PinnableSlice pinnable_val;
+
+  ASSERT_OK(db->Put(write_options, Slice("foo"), Slice("bar")));
+  ASSERT_OK(db->Put(write_options, Slice("foo2"), Slice("bar")));
+
+  Transaction* txn = db->BeginTransaction(write_options, TransactionOptions());
+  ASSERT_TRUE(txn);
+
+  ASSERT_EQ(0, txn->GetNumPuts());
+  ASSERT_LE(0, txn->GetID());
+
+  ASSERT_OK(txn->GetForUpdate(read_options, "foo", &pinnable_val));
+  ASSERT_EQ(*pinnable_val.GetSelf(), std::string("bar"));
+
+  ASSERT_OK(txn->Put(Slice("foo"), Slice("bar2")));
+
+  ASSERT_EQ(1, txn->GetNumPuts());
+
+  ASSERT_OK(txn->GetForUpdate(read_options, "foo", &pinnable_val));
+  ASSERT_EQ(*pinnable_val.GetSelf(), std::string("bar2"));
+
+  ASSERT_OK(txn->Commit());
+
+  ASSERT_OK(
+      db->Get(read_options, db->DefaultColumnFamily(), "foo", &pinnable_val));
+  ASSERT_EQ(*pinnable_val.GetSelf(), std::string("bar2"));
+
+  delete txn;
+}
+
 TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommit_WC) {
   const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
 
@@ -543,13 +579,16 @@ TEST_P(TransactionTest, SharedLocks) {
   ASSERT_TRUE(txn3);
 
   // Test shared access between txns
-  s = txn1->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn3->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn3->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
   auto lock_data = db->GetLockStatusData();
@@ -572,23 +611,25 @@ TEST_P(TransactionTest, SharedLocks) {
   ASSERT_OK(txn3->Rollback());
 
   // Test txn1 and txn2 sharing a lock and txn3 trying to obtain it.
-  s = txn1->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn3->GetForUpdate(read_options, "foo", nullptr);
+  s = txn3->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
   txn1->UndoGetForUpdate("foo");
-  s = txn3->GetForUpdate(read_options, "foo", nullptr);
+  s = txn3->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
   txn2->UndoGetForUpdate("foo");
-  s = txn3->GetForUpdate(read_options, "foo", nullptr);
+  s = txn3->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_OK(s);
 
   ASSERT_OK(txn1->Rollback());
@@ -596,36 +637,42 @@ TEST_P(TransactionTest, SharedLocks) {
   ASSERT_OK(txn3->Rollback());
 
   // Test txn1 and txn2 sharing a lock and txn2 trying to upgrade lock.
-  s = txn1->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
   txn1->UndoGetForUpdate("foo");
-  s = txn2->GetForUpdate(read_options, "foo", nullptr);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_OK(s);
 
   ASSERT_OK(txn1->Rollback());
   ASSERT_OK(txn2->Rollback());
 
   // Test txn1 trying to downgrade its lock.
-  s = txn1->GetForUpdate(read_options, "foo", nullptr, true /* exclusive */);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         true /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
   // Should still fail after "downgrading".
-  s = txn1->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
@@ -634,15 +681,17 @@ TEST_P(TransactionTest, SharedLocks) {
 
   // Test txn1 holding an exclusive lock and txn2 trying to obtain shared
   // access.
-  s = txn1->GetForUpdate(read_options, "foo", nullptr);
+  s = txn1->GetForUpdate(read_options, "foo", (std::string*)nullptr);
   ASSERT_OK(s);
 
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_TRUE(s.IsTimedOut());
   ASSERT_EQ(s.ToString(), "Operation timed out: Timeout waiting to lock key");
 
   txn1->UndoGetForUpdate("foo");
-  s = txn2->GetForUpdate(read_options, "foo", nullptr, false /* exclusive */);
+  s = txn2->GetForUpdate(read_options, "foo", (std::string*)nullptr,
+                         false /* exclusive */);
   ASSERT_OK(s);
 
   delete txn1;
@@ -676,8 +725,9 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
   for (uint32_t i = 0; i < 31; i++) {
     txns[i] = db->BeginTransaction(write_options, txn_options);
     ASSERT_TRUE(txns[i]);
-    auto s = txns[i]->GetForUpdate(read_options, std::to_string((i + 1) / 2),
-                                   nullptr, false /* exclusive */);
+    auto s =
+        txns[i]->GetForUpdate(read_options, std::to_string((i + 1) / 2),
+                              (std::string*)nullptr, false /* exclusive */);
     ASSERT_OK(s);
   }
 
@@ -691,8 +741,9 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
   std::vector<port::Thread> threads;
   for (uint32_t i = 0; i < 15; i++) {
     std::function<void()> blocking_thread = [&, i] {
-      auto s = txns[i]->GetForUpdate(read_options, std::to_string(i + 1),
-                                     nullptr, true /* exclusive */);
+      auto s =
+          txns[i]->GetForUpdate(read_options, std::to_string(i + 1),
+                                (std::string*)nullptr, true /* exclusive */);
       ASSERT_OK(s);
       ASSERT_OK(txns[i]->Rollback());
       delete txns[i];
@@ -710,8 +761,8 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
 
   // Complete the cycle T[16 - 31] -> T1
   for (uint32_t i = 15; i < 31; i++) {
-    auto s =
-        txns[i]->GetForUpdate(read_options, "0", nullptr, true /* exclusive */);
+    auto s = txns[i]->GetForUpdate(read_options, "0", (std::string*)nullptr,
+                                   true /* exclusive */);
     ASSERT_TRUE(s.IsDeadlock());
 
     // Calculate next buffer len, plateau at 5 when 5 records are inserted.
@@ -810,8 +861,8 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
   for (uint32_t i = 0; i < 2; i++) {
     txns_shared[i] = db->BeginTransaction(write_options, txn_options);
     ASSERT_TRUE(txns_shared[i]);
-    auto s =
-        txns_shared[i]->GetForUpdate(read_options, std::to_string(i), nullptr);
+    auto s = txns_shared[i]->GetForUpdate(read_options, std::to_string(i),
+                                          (std::string*)nullptr);
     ASSERT_OK(s);
   }
 
@@ -825,7 +876,7 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
   for (uint32_t i = 0; i < 1; i++) {
     std::function<void()> blocking_thread = [&, i] {
       auto s = txns_shared[i]->GetForUpdate(read_options, std::to_string(i + 1),
-                                            nullptr);
+                                            (std::string*)nullptr);
       ASSERT_OK(s);
       ASSERT_OK(txns_shared[i]->Rollback());
       delete txns_shared[i];
@@ -842,7 +893,8 @@ TEST_P(TransactionTest, DeadlockCycleShared) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 
   // Complete the cycle T2 -> T1 with a shared lock.
-  auto s = txns_shared[1]->GetForUpdate(read_options, "0", nullptr, false);
+  auto s = txns_shared[1]->GetForUpdate(read_options, "0",
+                                        (std::string*)nullptr, false);
   ASSERT_TRUE(s.IsDeadlock());
 
   auto dlock_buffer = db->GetDeadlockInfoBuffer();
@@ -884,7 +936,8 @@ TEST_P(TransactionStressTest, DeadlockCycle) {
     for (uint32_t i = 0; i < len; i++) {
       txns[i] = db->BeginTransaction(write_options, txn_options);
       ASSERT_TRUE(txns[i]);
-      auto s = txns[i]->GetForUpdate(read_options, std::to_string(i), nullptr);
+      auto s = txns[i]->GetForUpdate(read_options, std::to_string(i),
+                                     (std::string*)nullptr);
       ASSERT_OK(s);
     }
 
@@ -899,8 +952,8 @@ TEST_P(TransactionStressTest, DeadlockCycle) {
     std::vector<port::Thread> threads;
     for (uint32_t i = 0; i + 1 < len; i++) {
       std::function<void()> blocking_thread = [&, i] {
-        auto s =
-            txns[i]->GetForUpdate(read_options, std::to_string(i + 1), nullptr);
+        auto s = txns[i]->GetForUpdate(read_options, std::to_string(i + 1),
+                                       (std::string*)nullptr);
         ASSERT_OK(s);
         ASSERT_OK(txns[i]->Rollback());
         delete txns[i];
@@ -917,7 +970,8 @@ TEST_P(TransactionStressTest, DeadlockCycle) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 
     // Complete the cycle Tlen -> T1
-    auto s = txns[len - 1]->GetForUpdate(read_options, "0", nullptr);
+    auto s =
+        txns[len - 1]->GetForUpdate(read_options, "0", (std::string*)nullptr);
     ASSERT_TRUE(s.IsDeadlock());
 
     const uint32_t dlock_buffer_size_ = (len - 1 > 5) ? 5 : (len - 1);
@@ -1004,8 +1058,8 @@ TEST_P(TransactionStressTest, DeadlockStress) {
       // Lock keys in random order.
       for (const auto& k : random_keys) {
         // Lock mostly for shared access, but exclusive 1/4 of the time.
-        auto s =
-            txn->GetForUpdate(read_options, k, nullptr, txn->GetID() % 4 == 0);
+        auto s = txn->GetForUpdate(read_options, k, (std::string*)nullptr,
+                                   txn->GetID() % 4 == 0);
         if (!s.ok()) {
           ASSERT_TRUE(s.IsDeadlock());
           ASSERT_OK(txn->Rollback());
@@ -2787,13 +2841,10 @@ TEST_P(TransactionTest, ColumnFamiliesTest) {
   // open DB with three column families
   std::vector<ColumnFamilyDescriptor> column_families;
   // have to open default column family
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
   // open the new column families
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFA", ColumnFamilyOptions()));
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFB", ColumnFamilyOptions()));
+  column_families.emplace_back("CFA", ColumnFamilyOptions());
+  column_families.emplace_back("CFB", ColumnFamilyOptions());
 
   std::vector<ColumnFamilyHandle*> handles;
 
@@ -2951,11 +3002,10 @@ TEST_P(TransactionTest, MultiGetBatchedTest) {
   // open DB with three column families
   std::vector<ColumnFamilyDescriptor> column_families;
   // have to open default column family
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
   // open the new column families
   cf_options.merge_operator = MergeOperators::CreateStringAppendOperator();
-  column_families.push_back(ColumnFamilyDescriptor("CF", cf_options));
+  column_families.emplace_back("CF", cf_options);
 
   std::vector<ColumnFamilyHandle*> handles;
 
@@ -3045,11 +3095,10 @@ TEST_P(TransactionTest, MultiGetLargeBatchedTest) {
   // open DB with three column families
   std::vector<ColumnFamilyDescriptor> column_families;
   // have to open default column family
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
   // open the new column families
   cf_options.merge_operator = MergeOperators::CreateStringAppendOperator();
-  column_families.push_back(ColumnFamilyDescriptor("CF", cf_options));
+  column_families.emplace_back("CF", cf_options);
 
   std::vector<ColumnFamilyHandle*> handles;
 
@@ -3877,7 +3926,7 @@ TEST_P(TransactionTest, IteratorTest) {
     ASSERT_TRUE(iter->Valid());
     ASSERT_EQ(results[i], iter->value().ToString());
 
-    s = txn->GetForUpdate(read_options, iter->key(), nullptr);
+    s = txn->GetForUpdate(read_options, iter->key(), (std::string*)nullptr);
     if (i == 2) {
       // "C" was modified after txn's snapshot
       ASSERT_TRUE(s.IsBusy());
@@ -4800,7 +4849,7 @@ TEST_P(TransactionTest, TimeoutTest) {
   txn_options0.lock_timeout = 50;  // txn timeout no longer infinite
   Transaction* txn1 = db->BeginTransaction(write_options, txn_options0);
 
-  s = txn1->GetForUpdate(read_options, "aaa", nullptr);
+  s = txn1->GetForUpdate(read_options, "aaa", (std::string*)nullptr);
   ASSERT_OK(s);
 
   // Conflicts with previous GetForUpdate.
@@ -4837,7 +4886,7 @@ TEST_P(TransactionTest, TimeoutTest) {
   txn_options.expiration = 100;  // 100ms
   txn1 = db->BeginTransaction(write_options, txn_options);
 
-  s = txn1->GetForUpdate(read_options, "aaa", nullptr);
+  s = txn1->GetForUpdate(read_options, "aaa", (std::string*)nullptr);
   ASSERT_OK(s);
 
   // Conflicts with previous GetForUpdate.
@@ -5457,13 +5506,10 @@ TEST_P(TransactionTest, ToggleAutoCompactionTest) {
   // open DB with three column families
   std::vector<ColumnFamilyDescriptor> column_families;
   // have to open default column family
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions()));
+  column_families.emplace_back(kDefaultColumnFamilyName, ColumnFamilyOptions());
   // open the new column families
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFA", ColumnFamilyOptions()));
-  column_families.push_back(
-      ColumnFamilyDescriptor("CFB", ColumnFamilyOptions()));
+  column_families.emplace_back("CFA", ColumnFamilyOptions());
+  column_families.emplace_back("CFB", ColumnFamilyOptions());
 
   ColumnFamilyOptions* cf_opt_default = &column_families[0].options;
   ColumnFamilyOptions* cf_opt_cfa = &column_families[1].options;
@@ -5860,7 +5906,7 @@ TEST_P(TransactionTest, Optimizations) {
 // A comparator that uses only the first three bytes
 class ThreeBytewiseComparator : public Comparator {
  public:
-  ThreeBytewiseComparator() {}
+  ThreeBytewiseComparator() = default;
   const char* Name() const override { return "test.ThreeBytewiseComparator"; }
   int Compare(const Slice& a, const Slice& b) const override {
     Slice na = Slice(a.data(), a.size() < 3 ? a.size() : 3);
@@ -6481,10 +6527,9 @@ TEST_P(TransactionTest, DoubleCrashInRecovery) {
       // Recover from corruption
       std::vector<ColumnFamilyHandle*> handles;
       std::vector<ColumnFamilyDescriptor> column_families;
-      column_families.push_back(ColumnFamilyDescriptor(kDefaultColumnFamilyName,
-                                                       ColumnFamilyOptions()));
-      column_families.push_back(
-          ColumnFamilyDescriptor("two", ColumnFamilyOptions()));
+      column_families.emplace_back(kDefaultColumnFamilyName,
+                                   ColumnFamilyOptions());
+      column_families.emplace_back("two", ColumnFamilyOptions());
       ASSERT_OK(ReOpenNoDelete(column_families, &handles));
       assert(db != nullptr);
 
@@ -6628,7 +6673,7 @@ TEST_P(TransactionTest, WriteWithBulkCreatedColumnFamilies) {
   std::vector<std::string> cf_names;
   std::vector<ColumnFamilyHandle*> cf_handles;
 
-  cf_names.push_back("test_cf");
+  cf_names.emplace_back("test_cf");
 
   ASSERT_OK(db->CreateColumnFamilies(cf_options, cf_names, &cf_handles));
   ASSERT_OK(db->Put(write_options, cf_handles[0], "foo", "bar"));
