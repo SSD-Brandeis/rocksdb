@@ -477,13 +477,16 @@ void SuperVersion::Cleanup() {
   cfd->UnrefAndTryDelete();
 }
 
-void SuperVersion::Init(ColumnFamilyData* new_cfd, MemTable* new_mem,
-                        MemTableListVersion* new_imm, Version* new_current) {
+void SuperVersion::Init(
+    ColumnFamilyData* new_cfd, MemTable* new_mem, MemTableListVersion* new_imm,
+    Version* new_current,
+    std::shared_ptr<const SeqnoToTimeMapping> new_seqno_to_time_mapping) {
   cfd = new_cfd;
   mem = new_mem;
   imm = new_imm;
   current = new_current;
   full_history_ts_low = cfd->GetFullHistoryTsLow();
+  seqno_to_time_mapping = std::move(new_seqno_to_time_mapping);
   cfd->Ref();
   mem->Ref();
   imm->Ref();
@@ -535,6 +538,7 @@ ColumnFamilyData::ColumnFamilyData(
       refs_(0),
       initialized_(false),
       dropped_(false),
+      flush_skip_reschedule_(false),
       internal_comparator_(cf_options.comparator),
       initial_cf_options_(SanitizeOptions(db_options, cf_options)),
       ioptions_(db_options, initial_cf_options_),
@@ -1196,11 +1200,12 @@ Status ColumnFamilyData::RangesOverlapWithMemtables(
   ReadOptions read_opts;
   read_opts.total_order_seek = true;
   MergeIteratorBuilder merge_iter_builder(&internal_comparator_, &arena);
-  merge_iter_builder.AddIterator(
-      super_version->mem->NewIterator(read_opts, &arena));
-  super_version->imm->AddIterators(read_opts, &merge_iter_builder,
+  merge_iter_builder.AddIterator(super_version->mem->NewIterator(
+      read_opts, /*seqno_to_time_mapping=*/nullptr, &arena));
+  super_version->imm->AddIterators(read_opts, /*seqno_to_time_mapping=*/nullptr,
+                                   &merge_iter_builder,
                                    false /* add_range_tombstone_iter */);
-  ScopedArenaIterator memtable_iter(merge_iter_builder.Finish());
+  ScopedArenaPtr<InternalIterator> memtable_iter(merge_iter_builder.Finish());
 
   auto read_seq = super_version->current->version_set()->LastSequence();
   ReadRangeDelAggregator range_del_agg(&internal_comparator_, read_seq);
@@ -1336,7 +1341,12 @@ void ColumnFamilyData::InstallSuperVersion(
     const MutableCFOptions& mutable_cf_options) {
   SuperVersion* new_superversion = sv_context->new_superversion.release();
   new_superversion->mutable_cf_options = mutable_cf_options;
-  new_superversion->Init(this, mem_, imm_.current(), current_);
+  new_superversion->Init(this, mem_, imm_.current(), current_,
+                         sv_context->new_seqno_to_time_mapping
+                             ? std::move(sv_context->new_seqno_to_time_mapping)
+                         : super_version_
+                             ? super_version_->ShareSeqnoToTimeMapping()
+                             : nullptr);
   SuperVersion* old_superversion = super_version_;
   super_version_ = new_superversion;
   if (old_superversion == nullptr || old_superversion->current != current() ||
@@ -1519,6 +1529,20 @@ Status ColumnFamilyData::ValidateOptions(
       }
     }
   }
+
+  if (cf_options.compaction_style == kCompactionStyleUniversal) {
+    int max_read_amp = cf_options.compaction_options_universal.max_read_amp;
+    if (max_read_amp < -1) {
+      return Status::NotSupported(
+          "CompactionOptionsUniversal::max_read_amp should be at least -1.");
+    } else if (0 < max_read_amp &&
+               max_read_amp < cf_options.level0_file_num_compaction_trigger) {
+      return Status::NotSupported(
+          "CompactionOptionsUniversal::max_read_amp limits the number of sorted"
+          " runs but is smaller than the compaction trigger "
+          "level0_file_num_compaction_trigger.");
+    }
+  }
   return s;
 }
 
@@ -1596,6 +1620,19 @@ FSDirectory* ColumnFamilyData::GetDataDir(size_t path_id) const {
 
   assert(path_id < data_dirs_.size());
   return data_dirs_[path_id].get();
+}
+
+void ColumnFamilyData::SetFlushSkipReschedule() {
+  const Comparator* ucmp = user_comparator();
+  const size_t ts_sz = ucmp->timestamp_size();
+  if (ts_sz == 0 || ioptions_.persist_user_defined_timestamps) {
+    return;
+  }
+  flush_skip_reschedule_.store(true);
+}
+
+bool ColumnFamilyData::GetAndClearFlushSkipReschedule() {
+  return flush_skip_reschedule_.exchange(false);
 }
 
 bool ColumnFamilyData::ShouldPostponeFlushToRetainUDT(

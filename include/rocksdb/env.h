@@ -145,6 +145,11 @@ struct EnvOptions {
 // Exceptions MUST NOT propagate out of overridden functions into RocksDB,
 // because RocksDB is not exception-safe. This could cause undefined behavior
 // including data loss, unreported corruption, deadlocks, and more.
+// An interface that abstracts RocksDB's interactions with the operating system
+// environment. There are three main types of APIs:
+// 1) File system operations, like creating a file, writing to a file, etc.
+// 2) Thread management.
+// 3) Misc functions, like getting the current time.
 class Env : public Customizable {
  public:
   static const char* kDefaultName() { return "DefaultEnv"; }
@@ -1208,6 +1213,10 @@ enum InfoLogLevel : unsigned char {
 class Logger {
  public:
   static constexpr size_t kDoNotSupportGetLogFileSize = SIZE_MAX;
+
+  // Set to INFO_LEVEL when RocksDB is compiled in release mode, and
+  // DEBUG_LEVEL when compiled in debug mode. See DBOptions::info_log_level.
+  static const InfoLogLevel kDefaultLogLevel;
 
   explicit Logger(const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL)
       : closed_(false), log_level_(log_level) {}

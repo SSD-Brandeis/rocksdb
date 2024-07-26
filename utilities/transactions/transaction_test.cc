@@ -3,10 +3,10 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/transaction_test.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <string>
 #include <thread>
@@ -334,6 +334,7 @@ TEST_P(TransactionTest, SwitchMemtableDuringPrepareAndCommit_WC) {
     ASSERT_EQ("value", value);
   }
 
+  ASSERT_OK(dbimpl->SyncWAL());
   delete db;
   db = nullptr;
   Status s;
@@ -2209,6 +2210,10 @@ TEST_P(TransactionTest, TwoPhaseLogRollingTest2) {
  * hidden behind improperly summed sequence ids
  */
 TEST_P(TransactionTest, TwoPhaseOutOfOrderDelete) {
+  // WAL recycling incompatible with disableWAL (below)
+  options.recycle_log_file_num = 0;
+  ASSERT_OK(ReOpenNoDelete());
+
   DBImpl* db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
   WriteOptions wal_on, wal_off;
   wal_on.sync = true;
@@ -2981,6 +2986,79 @@ TEST_P(TransactionTest, ColumnFamiliesTest) {
   }
 }
 
+TEST_P(TransactionTest, WriteImportedColumnFamilyTest) {
+  WriteOptions write_options;
+  ReadOptions read_options;
+  ColumnFamilyOptions cf_options;
+  ImportColumnFamilyOptions import_options;
+  ExportImportFilesMetaData* metadata_ptr = nullptr;
+  ColumnFamilyHandle* import_cf = nullptr;
+  ColumnFamilyHandle* export_cf = nullptr;
+  std::string export_files_dir = test::PerThreadDBPath(env.get(), "cf_export");
+  std::string value;
+  Status s;
+
+  {
+    // Create a column family to export
+    s = db->CreateColumnFamily(cf_options, "CF_EXPORT", &export_cf);
+    ASSERT_OK(s);
+
+    // Write some data to the db
+    WriteBatch batch;
+    ASSERT_OK(batch.Put(export_cf, "K1", "V1"));
+    ASSERT_OK(batch.Put(export_cf, "K2", "V2"));
+    s = db->Write(write_options, &batch);
+    ASSERT_OK(s);
+
+    Checkpoint* checkpoint = nullptr;
+    s = Checkpoint::Create(db, &checkpoint);
+    ASSERT_OK(s);
+    s = checkpoint->ExportColumnFamily(export_cf, export_files_dir,
+                                       &metadata_ptr);
+    ASSERT_OK(s);
+    ASSERT_NE(metadata_ptr, nullptr);
+    delete checkpoint;
+
+    s = db->DropColumnFamily(export_cf);
+    ASSERT_OK(s);
+    delete export_cf;
+  }
+
+  {
+    // Create a new column family with import
+    s = db->CreateColumnFamilyWithImport(
+        cf_options, "CF_IMPORT", import_options, *metadata_ptr, &import_cf);
+    ASSERT_OK(s);
+    s = db->Get(read_options, import_cf, "K1", &value);
+    ASSERT_OK(s);
+    ASSERT_EQ(value, "V1");
+    s = db->Get(read_options, import_cf, "K2", &value);
+    ASSERT_OK(s);
+    ASSERT_EQ(value, "V2");
+
+    // Wirte a new key-value pair
+    Transaction* txn = db->BeginTransaction(write_options);
+    ASSERT_TRUE(txn);
+    s = txn->Put(import_cf, "K3", "V3");
+    ASSERT_OK(s);
+    s = txn->Commit();
+    ASSERT_OK(s);
+    delete txn;
+
+    s = db->Get(read_options, import_cf, "K3", &value);
+    ASSERT_OK(s);
+    ASSERT_EQ(value, "V3");
+
+    s = db->DropColumnFamily(import_cf);
+    ASSERT_OK(s);
+    delete import_cf;
+  }
+
+  delete metadata_ptr;
+
+  EXPECT_OK(DestroyDir(env.get(), export_files_dir));
+}
+
 TEST_P(TransactionTest, MultiGetBatchedTest) {
   WriteOptions write_options;
   ReadOptions read_options, snapshot_read_options;
@@ -3547,6 +3625,9 @@ TEST_P(TransactionTest, UntrackedWrites) {
   // Untracked writes should succeed even though key was written after snapshot
   s = txn->PutUntracked("untracked", "1");
   ASSERT_OK(s);
+  s = txn->PutEntityUntracked(db->DefaultColumnFamily(), "untracked",
+                              {{"hello", "world"}});
+  ASSERT_OK(s);
   s = txn->MergeUntracked("untracked", "2");
   ASSERT_OK(s);
   s = txn->DeleteUntracked("untracked");
@@ -3554,6 +3635,8 @@ TEST_P(TransactionTest, UntrackedWrites) {
 
   // Conflict
   s = txn->Put("untracked", "3");
+  ASSERT_TRUE(s.IsBusy());
+  s = txn->PutEntity(db->DefaultColumnFamily(), "untracked", {{"foo", "bar"}});
   ASSERT_TRUE(s.IsBusy());
 
   s = txn->Commit();
@@ -6910,6 +6993,477 @@ TEST_P(TransactionTest, UnlockWALStallCleared) {
   }
 }
 
+TEST_P(TransactionTest, PutEntitySuccess) {
+  const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
+  if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {
+    ROCKSDB_GTEST_BYPASS("Test only WriteCommitted for now");
+    return;
+  }
+
+  constexpr char foo[] = "foo";
+  const WideColumns foo_columns{
+      {kDefaultWideColumnName, "bar"}, {"col1", "val1"}, {"col2", "val2"}};
+  const WideColumns foo_new_columns{
+      {kDefaultWideColumnName, "baz"}, {"colA", "valA"}, {"colB", "valB"}};
+
+  ASSERT_OK(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), foo,
+                          foo_columns));
+
+  {
+    std::unique_ptr<Transaction> txn(
+        db->BeginTransaction(WriteOptions(), TransactionOptions()));
+
+    ASSERT_NE(txn, nullptr);
+    ASSERT_NE(txn->GetID(), 0);
+    ASSERT_EQ(txn->GetNumPutEntities(), 0);
+
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo,
+                               &columns));
+      ASSERT_EQ(columns.columns(), foo_columns);
+    }
+
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn->GetEntityForUpdate(
+          ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+      ASSERT_EQ(columns.columns(), foo_columns);
+    }
+
+    ASSERT_OK(txn->PutEntity(db->DefaultColumnFamily(), foo, foo_new_columns));
+
+    ASSERT_EQ(txn->GetNumPutEntities(), 1);
+
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo,
+                               &columns));
+      ASSERT_EQ(columns.columns(), foo_new_columns);
+    }
+
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn->GetEntityForUpdate(
+          ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+      ASSERT_EQ(columns.columns(), foo_new_columns);
+    }
+
+    ASSERT_OK(txn->Commit());
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_new_columns);
+  }
+}
+
+TEST_P(TransactionTest, PutEntityWriteConflict) {
+  const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
+  if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {
+    ROCKSDB_GTEST_BYPASS("Test only WriteCommitted for now");
+    return;
+  }
+
+  constexpr char foo[] = "foo";
+  const WideColumns foo_columns{
+      {kDefaultWideColumnName, "bar"}, {"col1", "val1"}, {"col2", "val2"}};
+  constexpr char baz[] = "baz";
+  const WideColumns baz_columns{
+      {kDefaultWideColumnName, "quux"}, {"colA", "valA"}, {"colB", "valB"}};
+
+  ASSERT_OK(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), foo,
+                          foo_columns));
+  ASSERT_OK(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), baz,
+                          baz_columns));
+
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+  ASSERT_NE(txn, nullptr);
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo,
+                             &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), baz,
+                             &columns));
+    ASSERT_EQ(columns.columns(), baz_columns);
+  }
+
+  {
+    constexpr size_t num_keys = 2;
+
+    std::array<Slice, num_keys> keys{{foo, baz}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+
+    txn->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                        keys.data(), results.data(), statuses.data());
+
+    ASSERT_OK(statuses[0]);
+    ASSERT_OK(statuses[1]);
+
+    ASSERT_EQ(results[0].columns(), foo_columns);
+    ASSERT_EQ(results[1].columns(), baz_columns);
+  }
+
+  const WideColumns foo_new_columns{{kDefaultWideColumnName, "FOO"},
+                                    {"hello", "world"}};
+  const WideColumns baz_new_columns{{kDefaultWideColumnName, "BAZ"},
+                                    {"ping", "pong"}};
+
+  ASSERT_OK(txn->PutEntity(db->DefaultColumnFamily(), foo, foo_new_columns));
+  ASSERT_OK(txn->PutEntity(db->DefaultColumnFamily(), baz, baz_new_columns));
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo,
+                             &columns));
+    ASSERT_EQ(columns.columns(), foo_new_columns);
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), baz,
+                             &columns));
+    ASSERT_EQ(columns.columns(), baz_new_columns);
+  }
+
+  {
+    constexpr size_t num_keys = 2;
+
+    std::array<Slice, num_keys> keys{{foo, baz}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+
+    txn->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                        keys.data(), results.data(), statuses.data());
+
+    ASSERT_OK(statuses[0]);
+    ASSERT_OK(statuses[1]);
+
+    ASSERT_EQ(results[0].columns(), foo_new_columns);
+    ASSERT_EQ(results[1].columns(), baz_new_columns);
+  }
+
+  // This PutEntity outside of a transaction will conflict with the previous
+  // write
+  const WideColumns foo_conflict_columns{{kDefaultWideColumnName, "X"},
+                                         {"conflicting", "write"}};
+  ASSERT_TRUE(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), foo,
+                            foo_conflict_columns)
+                  .IsTimedOut());
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), baz, &columns));
+    ASSERT_EQ(columns.columns(), baz_columns);
+  }
+
+  {
+    constexpr size_t num_keys = 2;
+
+    std::array<Slice, num_keys> keys{{foo, baz}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    db->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                       keys.data(), results.data(), statuses.data(),
+                       sorted_input);
+
+    ASSERT_OK(statuses[0]);
+    ASSERT_OK(statuses[1]);
+
+    ASSERT_EQ(results[0].columns(), foo_columns);
+    ASSERT_EQ(results[1].columns(), baz_columns);
+  }
+
+  ASSERT_OK(txn->Commit());
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_new_columns);
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), baz, &columns));
+    ASSERT_EQ(columns.columns(), baz_new_columns);
+  }
+
+  {
+    constexpr size_t num_keys = 2;
+
+    std::array<Slice, num_keys> keys{{foo, baz}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    db->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                       keys.data(), results.data(), statuses.data(),
+                       sorted_input);
+
+    ASSERT_OK(statuses[0]);
+    ASSERT_OK(statuses[1]);
+
+    ASSERT_EQ(results[0].columns(), foo_new_columns);
+    ASSERT_EQ(results[1].columns(), baz_new_columns);
+  }
+}
+
+TEST_P(TransactionTest, PutEntityReadConflict) {
+  const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
+  if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {
+    ROCKSDB_GTEST_BYPASS("Test only WriteCommitted for now");
+    return;
+  }
+
+  constexpr char foo[] = "foo";
+  const WideColumns foo_columns{
+      {kDefaultWideColumnName, "bar"}, {"col1", "val1"}, {"col2", "val2"}};
+
+  ASSERT_OK(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), foo,
+                          foo_columns));
+
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+  ASSERT_NE(txn, nullptr);
+
+  txn->SetSnapshot();
+
+  ReadOptions snapshot_read_options;
+  snapshot_read_options.snapshot = txn->GetSnapshot();
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntityForUpdate(
+        snapshot_read_options, db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+
+  // This PutEntity outside of a transaction will conflict with the previous
+  // write
+  const WideColumns foo_conflict_columns{{kDefaultWideColumnName, "X"},
+                                         {"conflicting", "write"}};
+  ASSERT_TRUE(db->PutEntity(WriteOptions(), db->DefaultColumnFamily(), foo,
+                            foo_conflict_columns)
+                  .IsTimedOut());
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo,
+                             &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+
+  ASSERT_OK(txn->Commit());
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+}
+
+TEST_P(TransactionTest, EntityReadSanityChecks) {
+  constexpr char foo[] = "foo";
+  constexpr char bar[] = "bar";
+  constexpr size_t num_keys = 2;
+
+  std::unique_ptr<Transaction> txn(db->BeginTransaction(WriteOptions()));
+  ASSERT_NE(txn, nullptr);
+
+  {
+    constexpr ColumnFamilyHandle* column_family = nullptr;
+    PinnableWideColumns columns;
+    ASSERT_TRUE(txn->GetEntity(ReadOptions(), column_family, foo, &columns)
+                    .IsInvalidArgument());
+  }
+
+  {
+    constexpr PinnableWideColumns* columns = nullptr;
+    ASSERT_TRUE(
+        txn->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, columns)
+            .IsInvalidArgument());
+  }
+
+  {
+    ReadOptions read_options;
+    read_options.io_activity = Env::IOActivity::kGet;
+
+    PinnableWideColumns columns;
+    ASSERT_TRUE(
+        txn->GetEntity(read_options, db->DefaultColumnFamily(), foo, &columns)
+            .IsInvalidArgument());
+  }
+
+  {
+    constexpr ColumnFamilyHandle* column_family = nullptr;
+    std::array<Slice, num_keys> keys{{foo, bar}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    txn->MultiGetEntity(ReadOptions(), column_family, num_keys, keys.data(),
+                        results.data(), statuses.data(), sorted_input);
+
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+  }
+
+  {
+    constexpr Slice* keys = nullptr;
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    txn->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                        keys, results.data(), statuses.data(), sorted_input);
+
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+  }
+
+  {
+    std::array<Slice, num_keys> keys{{foo, bar}};
+    constexpr PinnableWideColumns* results = nullptr;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    txn->MultiGetEntity(ReadOptions(), db->DefaultColumnFamily(), num_keys,
+                        keys.data(), results, statuses.data(), sorted_input);
+
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+  }
+
+  {
+    ReadOptions read_options;
+    read_options.io_activity = Env::IOActivity::kMultiGet;
+
+    std::array<Slice, num_keys> keys{{foo, bar}};
+    std::array<PinnableWideColumns, num_keys> results;
+    std::array<Status, num_keys> statuses;
+    constexpr bool sorted_input = false;
+
+    txn->MultiGetEntity(read_options, db->DefaultColumnFamily(), num_keys,
+                        keys.data(), results.data(), statuses.data(),
+                        sorted_input);
+    ASSERT_TRUE(statuses[0].IsInvalidArgument());
+    ASSERT_TRUE(statuses[1].IsInvalidArgument());
+  }
+
+  {
+    constexpr ColumnFamilyHandle* column_family = nullptr;
+    PinnableWideColumns columns;
+    ASSERT_TRUE(
+        txn->GetEntityForUpdate(ReadOptions(), column_family, foo, &columns)
+            .IsInvalidArgument());
+  }
+
+  {
+    constexpr PinnableWideColumns* columns = nullptr;
+    ASSERT_TRUE(txn->GetEntityForUpdate(ReadOptions(),
+                                        db->DefaultColumnFamily(), foo, columns)
+                    .IsInvalidArgument());
+  }
+
+  {
+    ReadOptions read_options;
+    read_options.io_activity = Env::IOActivity::kGet;
+
+    PinnableWideColumns columns;
+    ASSERT_TRUE(txn->GetEntityForUpdate(read_options, db->DefaultColumnFamily(),
+                                        foo, &columns)
+                    .IsInvalidArgument());
+  }
+
+  {
+    txn->SetSnapshot();
+
+    ReadOptions read_options;
+    read_options.snapshot = txn->GetSnapshot();
+
+    PinnableWideColumns columns;
+    constexpr bool exclusive = true;
+    constexpr bool do_validate = false;
+
+    ASSERT_TRUE(txn->GetEntityForUpdate(read_options, db->DefaultColumnFamily(),
+                                        foo, &columns, exclusive, do_validate)
+                    .IsInvalidArgument());
+  }
+}
+
+TEST_P(TransactionTest, PutEntityRecovery) {
+  const TxnDBWritePolicy write_policy = std::get<2>(GetParam());
+  if (write_policy != TxnDBWritePolicy::WRITE_COMMITTED) {
+    ROCKSDB_GTEST_BYPASS("Test only WriteCommitted for now");
+    return;
+  }
+
+  constexpr char foo[] = "foo";
+  const WideColumns foo_columns{
+      {kDefaultWideColumnName, "bar"}, {"col1", "val1"}, {"col2", "val2"}};
+
+  constexpr char xid[] = "xid";
+
+  {
+    WriteOptions write_options;
+    write_options.sync = true;
+    write_options.disableWAL = false;
+
+    std::unique_ptr<Transaction> txn(db->BeginTransaction(write_options));
+    ASSERT_NE(txn, nullptr);
+
+    ASSERT_OK(txn->SetName(xid));
+
+    ASSERT_OK(txn->PutEntity(db->DefaultColumnFamily(), foo, foo_columns));
+
+    ASSERT_OK(txn->Prepare());
+  }
+
+  ASSERT_OK(ReOpenNoDelete());
+
+  {
+    std::unique_ptr<Transaction> txn(db->GetTransactionByName(xid));
+    ASSERT_NE(txn, nullptr);
+
+    ASSERT_OK(txn->Commit());
+  }
+
+  {
+    PinnableWideColumns columns;
+    ASSERT_OK(
+        db->GetEntity(ReadOptions(), db->DefaultColumnFamily(), foo, &columns));
+    ASSERT_EQ(columns.columns(), foo_columns);
+  }
+}
+
 TEST_F(TransactionDBTest, CollapseKey) {
   ASSERT_OK(ReOpen());
   ASSERT_OK(db->Put({}, "hello", "world"));
@@ -6956,6 +7510,51 @@ TEST_F(TransactionDBTest, CollapseKey) {
     std::unique_ptr<Transaction> txn1{
         db->BeginTransaction(WriteOptions{}, TransactionOptions{})};
     ASSERT_TRUE(txn1->CollapseKey(ReadOptions{}, "dummy").IsNotFound());
+  }
+}
+
+TEST_F(TransactionDBTest, FlushedLogWithPendingPrepareIsSynced) {
+  // Repro for a bug where we missed a necessary sync of the old WAL during
+  // memtable flush. It happened due to applying an optimization to skip syncing
+  // the old WAL in too many scenarios (all memtable flushes on single CF
+  // databases). That optimization is only valid when memtable flush can
+  // guarantee the old WAL will not be read by crash-recovery. When the old WAL
+  // contains a prepare record without its corresponding commit, that WAL will
+  // be read by crash-recovery and therefore it must be synced.
+  const int kStartIndex = 1000;
+  int next_index = kStartIndex;
+  ASSERT_OK(ReOpen());
+
+  ASSERT_OK(
+      db->Put(WriteOptions(), "key" + std::to_string(next_index), "value"));
+  next_index++;
+
+  Transaction* txn = db->BeginTransaction(WriteOptions(), TransactionOptions());
+  ASSERT_OK(txn->SetName("xid" + std::to_string(next_index)));
+  ASSERT_OK(
+      txn->Put(Slice("key" + std::to_string(next_index)), Slice("value")));
+  next_index++;
+  ASSERT_OK(txn->Prepare());
+
+  // Set it directly writable so new WAL containing the commit record will be
+  // recovered despite not being explicitly synced.
+  fault_fs->SetFilesystemDirectWritable(true);
+  ASSERT_OK(db->Flush(FlushOptions()));
+
+  ASSERT_OK(txn->Commit());
+  delete txn;
+
+  ASSERT_OK(
+      db->Put(WriteOptions(), "key" + std::to_string(next_index), "value"));
+  next_index++;
+
+  ASSERT_OK(ReOpenNoDelete());
+
+  for (int i = kStartIndex; i < next_index; i++) {
+    PinnableSlice value;
+    ASSERT_OK(db->Get(ReadOptions(), db->DefaultColumnFamily(),
+                      "key" + std::to_string(i), &value));
+    ASSERT_EQ("value", value);
   }
 }
 

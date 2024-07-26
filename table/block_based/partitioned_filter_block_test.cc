@@ -198,24 +198,23 @@ class PartitionedFilterBlockTest
     std::unique_ptr<PartitionedFilterBlockReader> reader(
         NewReader(builder, pib));
     // Querying added keys
-    const bool no_io = true;
     std::vector<std::string> keys = PrepareKeys(keys_without_ts, kKeyNum);
     for (const auto& key : keys) {
       auto ikey = InternalKey(key, 0, ValueType::kTypeValue);
       const Slice ikey_slice = Slice(*ikey.rep());
       ASSERT_TRUE(reader->KeyMayMatch(
-          StripTimestampFromUserKey(key, ts_sz_), !no_io, &ikey_slice,
+          StripTimestampFromUserKey(key, ts_sz_), &ikey_slice,
           /*get_context=*/nullptr,
-          /*lookup_context=*/nullptr, ReadOptions()));
+          /*lookup_context=*/nullptr, test::kReadOptionsNoIo));
     }
     {
       // querying a key twice
       auto ikey = InternalKey(keys[0], 0, ValueType::kTypeValue);
       const Slice ikey_slice = Slice(*ikey.rep());
       ASSERT_TRUE(reader->KeyMayMatch(
-          StripTimestampFromUserKey(keys[0], ts_sz_), !no_io, &ikey_slice,
+          StripTimestampFromUserKey(keys[0], ts_sz_), &ikey_slice,
           /*get_context=*/nullptr,
-          /*lookup_context=*/nullptr, ReadOptions()));
+          /*lookup_context=*/nullptr, test::kReadOptionsNoIo));
     }
     // querying missing keys
     std::vector<std::string> missing_keys =
@@ -225,15 +224,15 @@ class PartitionedFilterBlockTest
       const Slice ikey_slice = Slice(*ikey.rep());
       if (empty) {
         ASSERT_TRUE(reader->KeyMayMatch(
-            StripTimestampFromUserKey(key, ts_sz_), !no_io, &ikey_slice,
+            StripTimestampFromUserKey(key, ts_sz_), &ikey_slice,
             /*get_context=*/nullptr,
-            /*lookup_context=*/nullptr, ReadOptions()));
+            /*lookup_context=*/nullptr, test::kReadOptionsNoIo));
       } else {
         // assuming a good hash function
         ASSERT_FALSE(reader->KeyMayMatch(
-            StripTimestampFromUserKey(key, ts_sz_), !no_io, &ikey_slice,
+            StripTimestampFromUserKey(key, ts_sz_), &ikey_slice,
             /*get_context=*/nullptr,
-            /*lookup_context=*/nullptr, ReadOptions()));
+            /*lookup_context=*/nullptr, test::kReadOptionsNoIo));
       }
     }
   }
@@ -306,7 +305,8 @@ class PartitionedFilterBlockTest
     std::string key =
         std::string(*InternalKey(user_key, 0, ValueType::kTypeValue).rep());
     BlockHandle dont_care_block_handle(1, 1);
-    builder->AddIndexEntry(&key, nullptr, dont_care_block_handle);
+    std::string scratch;
+    builder->AddIndexEntry(key, nullptr, dont_care_block_handle, &scratch);
   }
 
   void CutABlock(PartitionedIndexBuilder* builder, const std::string& user_key,
@@ -318,7 +318,8 @@ class PartitionedFilterBlockTest
         *InternalKey(next_user_key, 0, ValueType::kTypeValue).rep());
     BlockHandle dont_care_block_handle(1, 1);
     Slice slice = Slice(next_key.data(), next_key.size());
-    builder->AddIndexEntry(&key, &slice, dont_care_block_handle);
+    std::string scratch;
+    builder->AddIndexEntry(key, &slice, dont_care_block_handle, &scratch);
   }
 
   int CountNumOfIndexPartitions(PartitionedIndexBuilder* builder) {
@@ -389,11 +390,10 @@ TEST_P(PartitionedFilterBlockTest, SamePrefixInMultipleBlocks) {
   for (const auto& key : pkeys) {
     auto ikey = InternalKey(key, 0, ValueType::kTypeValue);
     const Slice ikey_slice = Slice(*ikey.rep());
-    ASSERT_TRUE(reader->PrefixMayMatch(prefix_extractor->Transform(key),
-                                       /*no_io=*/false, &ikey_slice,
-                                       /*get_context=*/nullptr,
-                                       /*lookup_context=*/nullptr,
-                                       ReadOptions()));
+    ASSERT_TRUE(
+        reader->PrefixMayMatch(prefix_extractor->Transform(key), &ikey_slice,
+                               /*get_context=*/nullptr,
+                               /*lookup_context=*/nullptr, ReadOptions()));
   }
   // Non-existent keys but with the same prefix
   const std::string pnonkeys_without_ts[4] = {"p-key9", "p-key11", "p-key21",
@@ -403,11 +403,10 @@ TEST_P(PartitionedFilterBlockTest, SamePrefixInMultipleBlocks) {
   for (const auto& key : pnonkeys) {
     auto ikey = InternalKey(key, 0, ValueType::kTypeValue);
     const Slice ikey_slice = Slice(*ikey.rep());
-    ASSERT_TRUE(reader->PrefixMayMatch(prefix_extractor->Transform(key),
-                                       /*no_io=*/false, &ikey_slice,
-                                       /*get_context=*/nullptr,
-                                       /*lookup_context=*/nullptr,
-                                       ReadOptions()));
+    ASSERT_TRUE(
+        reader->PrefixMayMatch(prefix_extractor->Transform(key), &ikey_slice,
+                               /*get_context=*/nullptr,
+                               /*lookup_context=*/nullptr, ReadOptions()));
   }
 }
 
@@ -444,8 +443,7 @@ TEST_P(PartitionedFilterBlockTest, PrefixInWrongPartitionBug) {
     auto prefix = prefix_extractor->Transform(key);
     auto ikey = InternalKey(key, 0, ValueType::kTypeValue);
     const Slice ikey_slice = Slice(*ikey.rep());
-    ASSERT_TRUE(reader->PrefixMayMatch(prefix,
-                                       /*no_io=*/false, &ikey_slice,
+    ASSERT_TRUE(reader->PrefixMayMatch(prefix, &ikey_slice,
                                        /*get_context=*/nullptr,
                                        /*lookup_context=*/nullptr,
                                        ReadOptions()));

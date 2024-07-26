@@ -46,6 +46,7 @@ const std::set<uint32_t> kFooterFormatVersionsToTest{
     kDefaultFormatVersion,
     kLatestFormatVersion,
 };
+const ReadOptionsNoIo kReadOptionsNoIo;
 
 std::string RandomKey(Random* rnd, int len, RandomKeyType type) {
   // Make sure to generate a wide variety of characters so we
@@ -563,6 +564,30 @@ Status TryDeleteDir(Env* env, const std::string& dirname) {
 // Delete a directory if it exists
 void DeleteDir(Env* env, const std::string& dirname) {
   TryDeleteDir(env, dirname).PermitUncheckedError();
+}
+
+FileType GetFileType(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return type;
+}
+
+uint64_t GetFileNumber(const std::string& path) {
+  FileType type = kTempFile;
+  std::size_t found = path.find_last_of('/');
+  if (found == std::string::npos) {
+    found = 0;
+  }
+  std::string file_name = path.substr(found);
+  uint64_t number = 0;
+  ParseFileName(file_name, &number, &type);
+  return number;
 }
 
 Status CreateEnvFromSystem(const ConfigOptions& config_options, Env** result,

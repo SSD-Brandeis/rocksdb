@@ -14,6 +14,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/file_system.h"
 #include "test_util/sync_point.h"
+#include "util/defer.h"
 #include "util/udt_util.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -270,8 +271,10 @@ TEST_F(DBWALTest, SyncWALNotWaitWrite) {
   ASSERT_OK(Put("foo3", "bar3"));
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
-      {"SpecialEnv::WalFile::Append:1", "DBWALTest::SyncWALNotWaitWrite:1"},
-      {"DBWALTest::SyncWALNotWaitWrite:2", "SpecialEnv::WalFile::Append:2"},
+      {"SpecialEnv::SpecialWalFile::Append:1",
+       "DBWALTest::SyncWALNotWaitWrite:1"},
+      {"DBWALTest::SyncWALNotWaitWrite:2",
+       "SpecialEnv::SpecialWalFile::Append:2"},
   });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -814,6 +817,7 @@ TEST_F(DBWALTest, WALWithChecksumHandoff) {
     writeOpt.disableWAL = false;
     // Data is persisted in the WAL
     ASSERT_OK(dbfull()->Put(writeOpt, handles_[1], "zoo", "v3"));
+    ASSERT_OK(dbfull()->SyncWAL());
     // The hash does not match, write fails
     fault_fs->SetChecksumHandoffFuncType(ChecksumType::kxxHash);
     writeOpt.disableWAL = false;
@@ -1123,15 +1127,13 @@ TEST_F(DBWALTest, PreallocateBlock) {
 }
 #endif  // !(defined NDEBUG) || !defined(OS_WIN)
 
-TEST_F(DBWALTest, DISABLED_FullPurgePreservesRecycledLog) {
-  // TODO(ajkr): Disabled until WAL recycling is fixed for
-  // `kPointInTimeRecovery`.
-
+TEST_F(DBWALTest, FullPurgePreservesRecycledLog) {
   // For github issue #1303
   for (int i = 0; i < 2; ++i) {
     Options options = CurrentOptions();
     options.create_if_missing = true;
     options.recycle_log_file_num = 2;
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
     if (i != 0) {
       options.wal_dir = alternative_wal_dir_;
     }
@@ -1162,16 +1164,14 @@ TEST_F(DBWALTest, DISABLED_FullPurgePreservesRecycledLog) {
   }
 }
 
-TEST_F(DBWALTest, DISABLED_FullPurgePreservesLogPendingReuse) {
-  // TODO(ajkr): Disabled until WAL recycling is fixed for
-  // `kPointInTimeRecovery`.
-
+TEST_F(DBWALTest, FullPurgePreservesLogPendingReuse) {
   // Ensures full purge cannot delete a WAL while it's in the process of being
   // recycled. In particular, we force the full purge after a file has been
   // chosen for reuse, but before it has been renamed.
   for (int i = 0; i < 2; ++i) {
     Options options = CurrentOptions();
     options.recycle_log_file_num = 1;
+    options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
     if (i != 0) {
       options.wal_dir = alternative_wal_dir_;
     }
@@ -1470,6 +1470,93 @@ TEST_F(DBWALTest, SyncMultipleLogs) {
   }
 
   ASSERT_OK(dbfull()->SyncWAL());
+}
+
+TEST_F(DBWALTest, SyncWalPartialFailure) {
+  class MyTestFileSystem : public FileSystemWrapper {
+   public:
+    explicit MyTestFileSystem(std::shared_ptr<FileSystem> base)
+        : FileSystemWrapper(std::move(base)) {}
+
+    static const char* kClassName() { return "MyTestFileSystem"; }
+    const char* Name() const override { return kClassName(); }
+    IOStatus NewWritableFile(const std::string& fname,
+                             const FileOptions& file_opts,
+                             std::unique_ptr<FSWritableFile>* result,
+                             IODebugContext* dbg) override {
+      IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+      if (s.ok()) {
+        *result =
+            std::make_unique<MyTestWritableFile>(std::move(*result), *this);
+      }
+      return s;
+    }
+
+    AcqRelAtomic<uint32_t> syncs_before_failure_{UINT32_MAX};
+
+   protected:
+    class MyTestWritableFile : public FSWritableFileOwnerWrapper {
+     public:
+      MyTestWritableFile(std::unique_ptr<FSWritableFile>&& file,
+                         MyTestFileSystem& fs)
+          : FSWritableFileOwnerWrapper(std::move(file)), fs_(fs) {}
+
+      IOStatus Sync(const IOOptions& options, IODebugContext* dbg) override {
+        int prev_val = fs_.syncs_before_failure_.FetchSub(1);
+        if (prev_val == 0) {
+          return IOStatus::IOError("fault");
+        } else {
+          return target()->Sync(options, dbg);
+        }
+      }
+
+     protected:
+      MyTestFileSystem& fs_;
+    };
+  };
+
+  Options options = CurrentOptions();
+  options.max_write_buffer_number = 4;
+  options.track_and_verify_wals_in_manifest = true;
+  options.max_bgerror_resume_count = 0;  // manual resume
+
+  auto custom_fs =
+      std::make_shared<MyTestFileSystem>(options.env->GetFileSystem());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(custom_fs));
+  options.env = fault_fs_env.get();
+  Reopen(options);
+  Defer closer([this]() { Close(); });
+
+  // This is the simplest way to get
+  // * one inactive WAL, synced
+  // * one inactive WAL, not synced, and
+  // * one active WAL, not synced
+  // with a single thread, to exercise as much logic as we reasonably can.
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->PauseBackgroundWork());
+  ASSERT_OK(Put("key1", "val1"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(db_->SyncWAL());
+  ASSERT_OK(Put("key2", "val2"));
+  ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_SwitchMemtable());
+  ASSERT_OK(Put("key3", "val3"));
+
+  // Allow 1 of the WALs to sync, but another won't
+  custom_fs->syncs_before_failure_.Store(1);
+  ASSERT_NOK(db_->SyncWAL());
+
+  // Stuck in this state. (This could previously cause a segfault.)
+  ASSERT_NOK(db_->SyncWAL());
+
+  // Can't Resume because WAL write failure is considered non-recoverable,
+  // regardless of the IOStatus itself. (Can/should be fixed?)
+  ASSERT_NOK(db_->Resume());
+
+  // Verify no data loss after reopen.
+  // Also Close() could previously crash in this state.
+  Reopen(options);
+  ASSERT_EQ("val1", Get("key1"));
+  ASSERT_EQ("val2", Get("key2"));
+  ASSERT_EQ("val3", Get("key3"));
 }
 
 // Github issue 1339. Prior the fix we read sequence id from the first log to
@@ -2670,6 +2757,60 @@ TEST_F(DBWALTest, EmptyWalReopenTest) {
   }
 }
 
+TEST_F(DBWALTest, RecoveryFlushSwitchWALOnEmptyMemtable) {
+  Options options = CurrentOptions();
+  auto fault_fs = std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::unique_ptr<Env> fault_fs_env(NewCompositeEnv(fault_fs));
+  options.env = fault_fs_env.get();
+  options.avoid_flush_during_shutdown = true;
+  DestroyAndReopen(options);
+
+  // Make sure the memtable switch in recovery flush happened after test checks
+  // the memtable is empty.
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBWALTest.RecoveryFlushSwitchWALOnEmptyMemtable:"
+        "AfterCheckMemtableEmpty",
+        "RecoverFromRetryableBGIOError:BeforeStart"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+  fault_fs->SetThreadLocalErrorContext(
+      FaultInjectionIOType::kMetadataWrite, 7 /* seed*/, 1 /* one_in */,
+      true /* retryable */, false /* has_data_loss*/);
+  fault_fs->EnableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataWrite);
+
+  WriteOptions wo;
+  wo.sync = true;
+  Status s = Put("k", "old_v", wo);
+  ASSERT_TRUE(s.IsIOError());
+  // To verify the key is not in memtable nor SST
+  ASSERT_TRUE(static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())
+                  ->cfd()
+                  ->mem()
+                  ->IsEmpty());
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+  TEST_SYNC_POINT(
+      "DBWALTest.RecoveryFlushSwitchWALOnEmptyMemtable:"
+      "AfterCheckMemtableEmpty");
+  SyncPoint::GetInstance()->DisableProcessing();
+
+  fault_fs->DisableThreadLocalErrorInjection(
+      FaultInjectionIOType::kMetadataWrite);
+
+  // Keep trying write until recovery of the previous IO error finishes
+  while (!s.ok()) {
+    options.env->SleepForMicroseconds(1000);
+    s = Put("k", "new_v");
+  }
+
+  // If recovery flush didn't switch WAL, we will end up having two duplicate
+  // WAL entries with same seqno and same key that violate assertion during WAL
+  // recovery and fail DB reopen
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+
+  ASSERT_EQ("new_v", Get("k"));
+  Destroy(options);
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

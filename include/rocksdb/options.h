@@ -234,6 +234,12 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Number of files to trigger level-0 compaction. A value <0 means that
   // level-0 compaction will not be triggered by number of files at all.
   //
+  // Universal compaction: RocksDB will try to keep the number of sorted runs
+  //   no more than this number. If CompactionOptionsUniversal::max_read_amp is
+  //   set, then this option will be used only as a trigger to look for
+  //   compaction. CompactionOptionsUniversal::max_read_amp will be the limit
+  //   on the number of sorted runs.
+  //
   // Default: 4
   //
   // Dynamically changeable through SetOptions() API
@@ -343,6 +349,48 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   uint32_t memtable_max_range_deletions = 0;
+
+  // EXPERIMENTAL
+  // When > 0, RocksDB attempts to erase some block cache entries for files
+  // that have become obsolete, which means they are about to be deleted.
+  // To avoid excessive tracking, this "uncaching" process is iterative and
+  // speculative, meaning it could incur extra background CPU effort if the
+  // file's blocks are generally not cached. A larger number indicates more
+  // willingness to spend CPU time to maximize block cache hit rates by
+  // erasing known-obsolete entries.
+  //
+  // When uncache_aggressiveness=1, block cache entries for an obsolete file
+  // are only erased until any attempted erase operation fails because the
+  // block is not cached. Then no further attempts are made to erase cached
+  // blocks for that file.
+  //
+  // For larger values, erasure is attempted until evidence incidates that the
+  // chance of success is < 0.99^(a-1), where a = uncache_aggressiveness. For
+  // example:
+  // 2 -> Attempt only while expecting >= 99% successful/useful erasure
+  // 11 -> 90%
+  // 69 -> 50%
+  // 110 -> 33%
+  // 230 -> 10%
+  // 460 -> 1%
+  // 690 -> 0.1%
+  // 1000 -> 1 in 23000
+  // 10000 -> Always (for all practical purposes)
+  // NOTE: UINT32_MAX and nearby values could take additional special meanings
+  // in the future.
+  //
+  // Pinned cache entries (guaranteed present) are always erased if
+  // uncache_aggressiveness > 0, but are not used in predicting the chances of
+  // successful erasure of non-pinned entries.
+  //
+  // NOTE: In the case of copied DBs (such as Checkpoints) sharing a block
+  // cache, it is possible that a file becoming obsolete doesn't mean its
+  // block cache entries (shared among copies) are obsolete. Such a scenerio
+  // is the best case for uncache_aggressiveness = 0.
+  //
+  // Once validated in production, the default will likely change to something
+  // around 300.
+  uint32_t uncache_aggressiveness = 0;
 
   // Create ColumnFamilyOptions with default values for all fields
   ColumnFamilyOptions();
@@ -597,9 +645,7 @@ struct DBOptions {
   bool verify_sst_unique_id_in_manifest = true;
 
   // Use the specified object to interact with the environment,
-  // e.g. to read/write files, schedule background work, etc. In the near
-  // future, support for doing storage operations such as read/write files
-  // through env will be deprecated in favor of file_system (see below)
+  // e.g. to read/write files, schedule background work, etc.
   // Default: Env::Default()
   Env* env = Env::Default();
 
@@ -643,11 +689,10 @@ struct DBOptions {
   // Default: nullptr
   std::shared_ptr<Logger> info_log = nullptr;
 
-#ifdef NDEBUG
-  InfoLogLevel info_log_level = INFO_LEVEL;
-#else
-  InfoLogLevel info_log_level = DEBUG_LEVEL;
-#endif  // NDEBUG
+  // Minimum level for sending log messages to info_log. The default is
+  // INFO_LEVEL when RocksDB is compiled in release mode, and DEBUG_LEVEL
+  // when it is compiled in debug mode.
+  InfoLogLevel info_log_level = Logger::kDefaultLogLevel;
 
   // Number of open files that can be used by the DB.  You may need to
   // increase this if your database has a large working set. Value -1 means
@@ -1053,6 +1098,9 @@ struct DBOptions {
   uint64_t bytes_per_sync = 0;
 
   // Same as bytes_per_sync, but applies to WAL files
+  // This does not gaurantee the WALs are synced in the order of creation. New
+  // WAL can be synced while an older WAL doesn't. Therefore upon system crash,
+  // this hole in the WAL data can create partial data loss.
   //
   // Default: 0, turned off
   //
@@ -1220,6 +1268,8 @@ struct DBOptions {
   bool allow_2pc = false;
 
   // A global cache for table-level rows.
+  // Used to speed up Get() queries.
+  // NOTE: does not work with DeleteRange() yet.
   // Default: nullptr (disabled)
   std::shared_ptr<RowCache> row_cache = nullptr;
 
@@ -1294,6 +1344,15 @@ struct DBOptions {
   // versions (>= RocksDB 7.4.0 for ZSTD) regardless of this setting when
   // the WAL is read.
   CompressionType wal_compression = kNoCompression;
+
+  // Set to true to re-instate an old behavior of keeping complete, synced WAL
+  // files open for write until they are collected for deletion by a
+  // background thread. This should not be needed unless there is a
+  // performance issue with file Close(), but setting it to true means that
+  // Checkpoint might call LinkFile on a WAL still open for write, which might
+  // be unsupported on some FileSystem implementations. As this is intended as
+  // a temporary kill switch, it is already DEPRECATED.
+  bool background_close_inactive_wals = false;
 
   // If true, RocksDB supports flushing multiple column families and committing
   // their results atomically to MANIFEST. Note that it is not
@@ -1484,6 +1543,30 @@ struct DBOptions {
   // use "0:00-23:59". To make an entire day have no offpeak period, leave
   // this field blank. Default: Empty string (no offpeak).
   std::string daily_offpeak_time_utc = "";
+
+  // EXPERIMENTAL
+
+  // When a RocksDB database is opened in follower mode, this option
+  // is set by the user to request the frequency of the follower
+  // attempting to refresh its view of the leader. RocksDB may choose to
+  // trigger catch ups more frequently if it detects any changes in the
+  // database state.
+  // Default every 10s.
+  uint64_t follower_refresh_catchup_period_ms = 10000;
+
+  // For a given catch up attempt, this option specifies the number of times
+  // to tail the MANIFEST and try to install a new, consistent  version before
+  // giving up. Though it should be extremely rare, the catch up may fail if
+  // the leader is mutating the LSM at a very high rate and the follower is
+  // unable to get a consistent view.
+  // Default to 10 attempts
+  uint64_t follower_catchup_retry_count = 10;
+
+  // Time to wait between consecutive catch up attempts
+  // Default 100ms
+  uint64_t follower_catchup_retry_wait_ms = 100;
+
+  // End EXPERIMENTAL
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -1908,20 +1991,29 @@ Status CreateLoggerFromOptions(const std::string& dbname,
 
 // CompactionOptions are used in CompactFiles() call.
 struct CompactionOptions {
+  // DEPRECATED: this option is unsafe because it allows the user to set any
+  // `CompressionType` while always using `CompressionOptions` from the
+  // `ColumnFamilyOptions`. As a result the `CompressionType` and
+  // `CompressionOptions` can easily be inconsistent.
+  //
   // Compaction output compression type
-  // Default: snappy
+  //
+  // Default: `kDisableCompressionOption`
+  //
   // If set to `kDisableCompressionOption`, RocksDB will choose compression type
-  // according to the `ColumnFamilyOptions`, taking into account the output
-  // level if `compression_per_level` is specified.
+  // according to the `ColumnFamilyOptions`. RocksDB takes into account the
+  // output level in case the `ColumnFamilyOptions` has level-specific settings.
   CompressionType compression;
+
   // Compaction will create files of size `output_file_size_limit`.
   // Default: MAX, which means that compaction will create a single file
   uint64_t output_file_size_limit;
+
   // If > 0, it will replace the option in the DBOptions for this compaction.
   uint32_t max_subcompactions;
 
   CompactionOptions()
-      : compression(kSnappyCompression),
+      : compression(kDisableCompressionOption),
         output_file_size_limit(std::numeric_limits<uint64_t>::max()),
         max_subcompactions(0) {}
 };
@@ -2087,6 +2179,24 @@ struct IngestExternalFileOptions {
   //
   // XXX: "bottommost" is obsolete/confusing terminology to refer to last level
   bool fail_if_not_bottommost_level = false;
+  // EXPERIMENTAL
+  // If set to true, ingestion will
+  // - allow the files to not be generated by SstFileWriter, and
+  // - ignore cf_id mismatch between cf_id in the files and the CF they are
+  // being ingested into.
+  //
+  // REQUIRES:
+  // - files to be ingested do not overlap with existing keys.
+  // - write_global_seqno = false
+  // - move_files = false
+  //
+  // Warning: This ONLY works for SST files where all keys have sequence number
+  // zero and with no duplicated user keys (this should be guaranteed if the
+  // file is generated by a DB with zero as the largest sequence number).
+  // We scan the entire SST files to validate sequence numbers.
+  // Warning: If a DB contains ingested files generated by another DB/CF,
+  // RepairDB() may not correctly recover these files. It may lose these files.
+  bool allow_db_generated_files = false;
 };
 
 enum TraceFilterType : uint64_t {
@@ -2208,6 +2318,9 @@ struct WaitForCompactOptions {
 
   // A boolean to flush all column families before starting to wait.
   bool flush = false;
+
+  // A boolean to wait for purge to complete
+  bool wait_for_purge = false;
 
   // A boolean to call Close() after waiting is done. By the time Close() is
   // called here, there should be no background jobs in progress and no new

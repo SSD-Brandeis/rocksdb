@@ -68,7 +68,9 @@ enum ValueType : unsigned char {
   kTypeDeletionWithTimestamp = 0x14,
   kTypeCommitXIDAndTimestamp = 0x15,  // WAL only
   kTypeWideColumnEntity = 0x16,
-  kTypeColumnFamilyWideColumnEntity = 0x17,  // WAL only
+  kTypeColumnFamilyWideColumnEntity = 0x17,     // WAL only
+  kTypeValuePreferredSeqno = 0x18,              // Value with a unix write time
+  kTypeColumnFamilyValuePreferredSeqno = 0x19,  // WAL only
   kTypeMaxValid,    // Should be after the last valid type, only used for
                     // validation
   kMaxValue = 0x7F  // Not used for storing records.
@@ -108,7 +110,8 @@ struct UserKeyRangePtr {
 // (i.e. a type used in memtable skiplist and sst file datablock).
 inline bool IsValueType(ValueType t) {
   return t <= kTypeMerge || kTypeSingleDeletion == t || kTypeBlobIndex == t ||
-         kTypeDeletionWithTimestamp == t || kTypeWideColumnEntity == t;
+         kTypeDeletionWithTimestamp == t || kTypeWideColumnEntity == t ||
+         kTypeValuePreferredSeqno == t;
 }
 
 // Checks whether a type is from user operation
@@ -145,7 +148,8 @@ struct ParsedInternalKey {
   // u contains timestamp if user timestamp feature is enabled.
   ParsedInternalKey(const Slice& u, const SequenceNumber& seq, ValueType t)
       : user_key(u), sequence(seq), type(t) {}
-  std::string DebugString(bool log_err_key, bool hex) const;
+  std::string DebugString(bool log_err_key, bool hex,
+                          const Comparator* ucmp = nullptr) const;
 
   void clear() {
     user_key.clear();
@@ -500,7 +504,7 @@ class InternalKey {
     AppendInternalKeyFooter(&rep_, s, t);
   }
 
-  std::string DebugString(bool hex) const;
+  std::string DebugString(bool hex, const Comparator* ucmp = nullptr) const;
 };
 
 inline int InternalKeyComparator::Compare(const InternalKey& a,
@@ -909,7 +913,8 @@ bool ReadKeyFromWriteBatchEntry(Slice* input, Slice* key, bool cf_record);
 // resulting from this call will include timestamp.
 Status ReadRecordFromWriteBatch(Slice* input, char* tag,
                                 uint32_t* column_family, Slice* key,
-                                Slice* value, Slice* blob, Slice* xid);
+                                Slice* value, Slice* blob, Slice* xid,
+                                uint64_t* write_unix_time);
 
 // When user call DeleteRange() to delete a range of keys,
 // we will store a serialized RangeTombstone in MemTable and SST.

@@ -13,6 +13,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <optional>
 
 #include "db/dbformat.h"
 #include "db/kv_checksum.h"
@@ -364,11 +365,13 @@ const char* EncodeKey(std::string* scratch, const Slice& target) {
 class MemTableIterator : public InternalIterator {
  public:
   MemTableIterator(const MemTable& mem, const ReadOptions& read_options,
+                   UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
                    Arena* arena, bool use_range_del_table = false)
       : bloom_(nullptr),
         prefix_extractor_(mem.prefix_extractor_),
         comparator_(mem.comparator_),
         valid_(false),
+        seqno_to_time_mapping_(seqno_to_time_mapping),
         arena_mode_(arena != nullptr),
         value_pinned_(
             !mem.GetImmutableMemTableOptions()->inplace_update_support),
@@ -499,6 +502,21 @@ class MemTableIterator : public InternalIterator {
     assert(Valid());
     return GetLengthPrefixedSlice(iter_->key());
   }
+
+  uint64_t write_unix_time() const override {
+    assert(Valid());
+    ParsedInternalKey pikey;
+    Status s = ParseInternalKey(key(), &pikey, /*log_err_key=*/false);
+    if (!s.ok()) {
+      return std::numeric_limits<uint64_t>::max();
+    } else if (kTypeValuePreferredSeqno == pikey.type) {
+      return ParsePackedValueForWriteTime(value());
+    } else if (!seqno_to_time_mapping_ || seqno_to_time_mapping_->Empty()) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return seqno_to_time_mapping_->GetProximalTimeBeforeSeqno(pikey.sequence);
+  }
+
   Slice value() const override {
     assert(Valid());
     Slice key_slice = GetLengthPrefixedSlice(iter_->key());
@@ -523,6 +541,8 @@ class MemTableIterator : public InternalIterator {
   const MemTable::KeyComparator comparator_;
   MemTableRep::Iterator* iter_;
   bool valid_;
+  // The seqno to time mapping is owned by the SuperVersion.
+  UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping_;
   bool arena_mode_;
   bool value_pinned_;
   uint32_t protection_bytes_per_key_;
@@ -541,11 +561,13 @@ class MemTableIterator : public InternalIterator {
   }
 };
 
-InternalIterator* MemTable::NewIterator(const ReadOptions& read_options,
-                                        Arena* arena) {
+InternalIterator* MemTable::NewIterator(
+    const ReadOptions& read_options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena) {
   assert(arena != nullptr);
   auto mem = arena->AllocateAligned(sizeof(MemTableIterator));
-  return new (mem) MemTableIterator(*this, read_options, arena);
+  return new (mem)
+      MemTableIterator(*this, read_options, seqno_to_time_mapping, arena);
 }
 
 FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIterator(
@@ -579,9 +601,9 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
   if (!cache->initialized.load(std::memory_order_acquire)) {
     cache->reader_mutex.lock();
     if (!cache->tombstones) {
-      auto* unfragmented_iter =
-          new MemTableIterator(*this, read_options, nullptr /* arena */,
-                               true /* use_range_del_table */);
+      auto* unfragmented_iter = new MemTableIterator(
+          *this, read_options, nullptr /* seqno_to_time_mapping= */,
+          nullptr /* arena */, true /* use_range_del_table */);
       cache->tombstones.reset(new FragmentedRangeTombstoneList(
           std::unique_ptr<InternalIterator>(unfragmented_iter),
           comparator_.comparator));
@@ -596,13 +618,14 @@ FragmentedRangeTombstoneIterator* MemTable::NewRangeTombstoneIteratorInternal(
 }
 
 void MemTable::ConstructFragmentedRangeTombstones() {
-  assert(!IsFragmentedRangeTombstonesConstructed(false));
-  // There should be no concurrent Construction
+  // There should be no concurrent Construction.
+  // We could also check fragmented_range_tombstone_list_ to avoid repeate
+  // constructions. We just construct them here again to be safe.
   if (!is_range_del_table_empty_.load(std::memory_order_relaxed)) {
     // TODO: plumb Env::IOActivity, Env::IOPriority
-    auto* unfragmented_iter =
-        new MemTableIterator(*this, ReadOptions(), nullptr /* arena */,
-                             true /* use_range_del_table */);
+    auto* unfragmented_iter = new MemTableIterator(
+        *this, ReadOptions(), nullptr /*seqno_to_time_mapping=*/,
+        nullptr /* arena */, true /* use_range_del_table */);
 
     fragmented_range_tombstone_list_ =
         std::make_unique<FragmentedRangeTombstoneList>(
@@ -744,8 +767,9 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   Slice key_without_ts = StripTimestampFromUserKey(key, ts_sz_);
 
   if (!allow_concurrent) {
-    // Extract prefix for insert with hint.
-    if (insert_with_hint_prefix_extractor_ != nullptr &&
+    // Extract prefix for insert with hint. Hints are for point key table
+    // (`table_`) only, not `range_del_table_`.
+    if (table == table_ && insert_with_hint_prefix_extractor_ != nullptr &&
         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {
       Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);
       bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
@@ -906,20 +930,9 @@ struct Saver {
 }  // anonymous namespace
 
 static bool SaveValue(void* arg, const char* entry) {
-  TEST_SYNC_POINT_CALLBACK("Memtable::SaveValue:Begin:entry", &entry);
   Saver* s = static_cast<Saver*>(arg);
   assert(s != nullptr);
   assert(!s->value || !s->columns);
-
-  if (s->protection_bytes_per_key > 0) {
-    *(s->status) = MemTable::VerifyEntryChecksum(
-        entry, s->protection_bytes_per_key, s->allow_data_in_errors);
-    if (!s->status->ok()) {
-      ROCKS_LOG_ERROR(s->logger, "In SaveValue: %s", s->status->getState());
-      // Memtable entry corrupted
-      return false;
-    }
-  }
 
   MergeContext* merge_context = s->merge_context;
   SequenceNumber max_covering_tombstone_seq = s->max_covering_tombstone_seq;
@@ -943,6 +956,22 @@ static bool SaveValue(void* arg, const char* entry) {
   if (user_comparator->EqualWithoutTimestamp(user_key_slice,
                                              s->key->user_key())) {
     // Correct user key
+    TEST_SYNC_POINT_CALLBACK("Memtable::SaveValue:Found:entry", &entry);
+    std::optional<ReadLock> read_lock;
+    if (s->inplace_update_support) {
+      read_lock.emplace(s->mem->GetLock(s->key->user_key()));
+    }
+
+    if (s->protection_bytes_per_key > 0) {
+      *(s->status) = MemTable::VerifyEntryChecksum(
+          entry, s->protection_bytes_per_key, s->allow_data_in_errors);
+      if (!s->status->ok()) {
+        ROCKS_LOG_ERROR(s->logger, "In SaveValue: %s", s->status->getState());
+        // Memtable entry corrupted
+        return false;
+      }
+    }
+
     const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
     ValueType type;
     SequenceNumber seq;
@@ -983,7 +1012,8 @@ static bool SaveValue(void* arg, const char* entry) {
 
     if ((type == kTypeValue || type == kTypeMerge || type == kTypeBlobIndex ||
          type == kTypeWideColumnEntity || type == kTypeDeletion ||
-         type == kTypeSingleDeletion || type == kTypeDeletionWithTimestamp) &&
+         type == kTypeSingleDeletion || type == kTypeDeletionWithTimestamp ||
+         type == kTypeValuePreferredSeqno) &&
         max_covering_tombstone_seq > seq) {
       type = kTypeRangeDeletion;
     }
@@ -1012,10 +1042,6 @@ static bool SaveValue(void* arg, const char* entry) {
           return false;
         }
 
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadLock();
-        }
-
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
 
         *(s->status) = Status::OK();
@@ -1026,21 +1052,18 @@ static bool SaveValue(void* arg, const char* entry) {
           s->columns->SetPlainValue(v);
         }
 
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadUnlock();
-        }
-
         *(s->found_final_value) = true;
         *(s->is_blob_index) = true;
 
         return false;
       }
-      case kTypeValue: {
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadLock();
-        }
-
+      case kTypeValue:
+      case kTypeValuePreferredSeqno: {
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
+
+        if (type == kTypeValuePreferredSeqno) {
+          v = ParsePackedValueForValue(v);
+        }
 
         *(s->status) = Status::OK();
 
@@ -1072,10 +1095,6 @@ static bool SaveValue(void* arg, const char* entry) {
           s->columns->SetPlainValue(v);
         }
 
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadUnlock();
-        }
-
         *(s->found_final_value) = true;
 
         if (s->is_blob_index != nullptr) {
@@ -1085,10 +1104,6 @@ static bool SaveValue(void* arg, const char* entry) {
         return false;
       }
       case kTypeWideColumnEntity: {
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadLock();
-        }
-
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
 
         *(s->status) = Status::OK();
@@ -1128,10 +1143,6 @@ static bool SaveValue(void* arg, const char* entry) {
           }
         } else if (s->columns) {
           *(s->status) = s->columns->SetWideColumnValue(v);
-        }
-
-        if (s->inplace_update_support) {
-          s->mem->GetLock(s->key->user_key())->ReadUnlock();
         }
 
         *(s->found_final_value) = true;
@@ -1201,6 +1212,14 @@ static bool SaveValue(void* arg, const char* entry) {
           *(s->found_final_value) = true;
           return false;
         }
+        if (merge_context->get_merge_operands_options != nullptr &&
+            merge_context->get_merge_operands_options->continue_cb != nullptr &&
+            !merge_context->get_merge_operands_options->continue_cb(v)) {
+          // We were told not to continue.
+          *(s->found_final_value) = true;
+          return false;
+        }
+
         return true;
       }
       default: {
@@ -1463,9 +1482,9 @@ Status MemTable::Update(SequenceNumber seq, ValueType value_type,
 
         // Update value, if new value size  <= previous value size
         if (new_size <= prev_size) {
+          WriteLock wl(GetLock(lkey.user_key()));
           char* p =
               EncodeVarint32(const_cast<char*>(key_ptr) + key_length, new_size);
-          WriteLock wl(GetLock(lkey.user_key()));
           memcpy(p, value.data(), value.size());
           assert((unsigned)((p + value.size()) - entry) ==
                  (unsigned)(VarintLength(key_length) + key_length +
@@ -1586,7 +1605,8 @@ Status MemTable::UpdateCallback(SequenceNumber seq, const Slice& key,
   return Status::NotFound();
 }
 
-size_t MemTable::CountSuccessiveMergeEntries(const LookupKey& key) {
+size_t MemTable::CountSuccessiveMergeEntries(const LookupKey& key,
+                                             size_t limit) {
   Slice memkey = key.memtable_key();
 
   // A total ordered iterator is costly for some memtablerep (prefix aware
@@ -1598,7 +1618,7 @@ size_t MemTable::CountSuccessiveMergeEntries(const LookupKey& key) {
 
   size_t num_successive_merges = 0;
 
-  for (; iter->Valid(); iter->Next()) {
+  for (; iter->Valid() && num_successive_merges < limit; iter->Next()) {
     const char* entry = iter->key();
     uint32_t key_length = 0;
     const char* iter_key_ptr = GetVarint32Ptr(entry, entry + 5, &key_length);

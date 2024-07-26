@@ -37,6 +37,7 @@ static std::unordered_map<std::string, WALRecoveryMode>
 
 static std::unordered_map<std::string, CacheTier> cache_tier_string_map = {
     {"kVolatileTier", CacheTier::kVolatileTier},
+    {"kVolatileCompressedTier", CacheTier::kVolatileCompressedTier},
     {"kNonVolatileBlockTier", CacheTier::kNonVolatileBlockTier}};
 
 static std::unordered_map<std::string, InfoLogLevel> info_log_level_string_map =
@@ -387,6 +388,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableDBOptions, wal_compression),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"background_close_inactive_wals",
+         {offsetof(struct ImmutableDBOptions, background_close_inactive_wals),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"seq_per_batch",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kNone}},
@@ -557,6 +562,19 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"enforce_single_del_contracts",
          {offsetof(struct ImmutableDBOptions, enforce_single_del_contracts),
           OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"follower_refresh_catchup_period_ms",
+         {offsetof(struct ImmutableDBOptions,
+                   follower_refresh_catchup_period_ms),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"follower_catchup_retry_count",
+         {offsetof(struct ImmutableDBOptions, follower_catchup_retry_count),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"follower_catchup_retry_wait_ms",
+         {offsetof(struct ImmutableDBOptions, follower_catchup_retry_wait_ms),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
 };
 
@@ -741,6 +759,7 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       two_write_queues(options.two_write_queues),
       manual_wal_flush(options.manual_wal_flush),
       wal_compression(options.wal_compression),
+      background_close_inactive_wals(options.background_close_inactive_wals),
       atomic_flush(options.atomic_flush),
       avoid_unnecessary_blocking_io(options.avoid_unnecessary_blocking_io),
       persist_stats_to_disk(options.persist_stats_to_disk),
@@ -755,7 +774,11 @@ ImmutableDBOptions::ImmutableDBOptions(const DBOptions& options)
       checksum_handoff_file_types(options.checksum_handoff_file_types),
       lowest_used_cache_tier(options.lowest_used_cache_tier),
       compaction_service(options.compaction_service),
-      enforce_single_del_contracts(options.enforce_single_del_contracts) {
+      enforce_single_del_contracts(options.enforce_single_del_contracts),
+      follower_refresh_catchup_period_ms(
+          options.follower_refresh_catchup_period_ms),
+      follower_catchup_retry_count(options.follower_catchup_retry_count),
+      follower_catchup_retry_wait_ms(options.follower_catchup_retry_wait_ms) {
   fs = env->GetFileSystem();
   clock = env->GetSystemClock().get();
   logger = info_log.get();
@@ -903,6 +926,9 @@ void ImmutableDBOptions::Dump(Logger* log) const {
                    manual_wal_flush);
   ROCKS_LOG_HEADER(log, "            Options.wal_compression: %d",
                    wal_compression);
+  ROCKS_LOG_HEADER(log,
+                   "            Options.background_close_inactive_wals: %d",
+                   background_close_inactive_wals);
   ROCKS_LOG_HEADER(log, "            Options.atomic_flush: %d", atomic_flush);
   ROCKS_LOG_HEADER(log,
                    "            Options.avoid_unnecessary_blocking_io: %d",

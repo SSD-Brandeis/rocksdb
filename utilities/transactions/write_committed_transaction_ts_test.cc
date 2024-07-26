@@ -288,12 +288,25 @@ TEST_P(WriteCommittedTxnWithTsTest, RecoverFromWal) {
 
   txn0.reset();
 
+  std::unique_ptr<Transaction> txn3(
+      NewTxn(WriteOptions(), TransactionOptions()));
+  assert(txn3);
+  ASSERT_OK(txn3->Put(handles_[1], "baz", "baz_value"));
+  ASSERT_OK(txn3->SetName("txn3"));
+  ASSERT_OK(txn3->Prepare());
+  txn3.reset();
+
   ASSERT_OK(ReOpenNoDelete(cf_descs, &handles_));
 
   {
+    Transaction* recovered_txn0 = db->GetTransactionByName("txn0");
+    ASSERT_OK(recovered_txn0->SetCommitTimestamp(23));
+    ASSERT_OK(recovered_txn0->Commit());
+    delete recovered_txn0;
     std::string value;
     Status s = GetFromDb(ReadOptions(), handles_[1], "foo", /*ts=*/23, &value);
-    ASSERT_TRUE(s.IsNotFound());
+    ASSERT_OK(s);
+    ASSERT_EQ("foo_value", value);
 
     s = db->Get(ReadOptions(), handles_[0], "bar", &value);
     ASSERT_OK(s);
@@ -314,6 +327,9 @@ TEST_P(WriteCommittedTxnWithTsTest, RecoverFromWal) {
     s = GetFromDb(ReadOptions(), handles_[1], "key1", /*ts=*/24, &value);
     ASSERT_OK(s);
     ASSERT_EQ("value_3", value);
+
+    s = GetFromDb(ReadOptions(), handles_[1], "baz", /*ts=*/24, &value);
+    ASSERT_TRUE(s.IsNotFound());
   }
 }
 
@@ -717,6 +733,147 @@ TEST_P(WriteCommittedTxnWithTsTest, CheckKeysForConflicts) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
+TEST_P(WriteCommittedTxnWithTsTest, GetEntityForUpdate) {
+  ASSERT_OK(ReOpenNoDelete());
+
+  ColumnFamilyOptions cf_options;
+  cf_options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+
+  const std::string test_cf_name = "test_cf";
+
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(cf_options, test_cf_name, &cfh));
+  std::unique_ptr<ColumnFamilyHandle> cfh_guard(cfh);
+
+  constexpr char foo[] = "foo";
+  constexpr char bar[] = "bar";
+  constexpr char baz[] = "baz";
+  constexpr char quux[] = "quux";
+
+  {
+    std::unique_ptr<Transaction> txn0(
+        NewTxn(WriteOptions(), TransactionOptions()));
+
+    {
+      std::unique_ptr<Transaction> txn1(
+          NewTxn(WriteOptions(), TransactionOptions()));
+      ASSERT_OK(txn1->Put(cfh, foo, bar));
+      ASSERT_OK(txn1->Put(cfh, baz, quux));
+      ASSERT_OK(txn1->SetCommitTimestamp(24));
+      ASSERT_OK(txn1->Commit());
+    }
+
+    ASSERT_OK(txn0->SetReadTimestampForValidation(23));
+
+    // Validation fails: timestamp from db(24) > validation timestamp(23)
+    PinnableWideColumns columns;
+    ASSERT_TRUE(
+        txn0->GetEntityForUpdate(ReadOptions(), cfh, foo, &columns).IsBusy());
+
+    ASSERT_OK(txn0->Rollback());
+  }
+
+  {
+    std::unique_ptr<Transaction> txn2(
+        NewTxn(WriteOptions(), TransactionOptions()));
+
+    ASSERT_OK(txn2->SetReadTimestampForValidation(25));
+
+    // Validation successful: timestamp from db(24) < validation timestamp (25)
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn2->GetEntityForUpdate(ReadOptions(), cfh, foo, &columns));
+    }
+
+    // Using a different read timestamp in ReadOptions while doing validation is
+    // not allowed
+    {
+      ReadOptions read_options;
+      std::string read_timestamp;
+      Slice diff_read_ts = EncodeU64Ts(24, &read_timestamp);
+      read_options.timestamp = &diff_read_ts;
+
+      PinnableWideColumns columns;
+      ASSERT_TRUE(txn2->GetEntityForUpdate(read_options, cfh, foo, &columns)
+                      .IsInvalidArgument());
+
+      ASSERT_OK(txn2->SetCommitTimestamp(26));
+      ASSERT_OK(txn2->Commit());
+    }
+  }
+
+  // GetEntityForUpdate with validation timestamp set but no validation is not
+  // allowed
+  {
+    std::unique_ptr<Transaction> txn3(
+        NewTxn(WriteOptions(), TransactionOptions()));
+
+    ASSERT_OK(txn3->SetReadTimestampForValidation(27));
+
+    PinnableWideColumns columns;
+    ASSERT_TRUE(txn3->GetEntityForUpdate(ReadOptions(), cfh, foo, &columns,
+                                         /*exclusive=*/true,
+                                         /*do_validate=*/false)
+                    .IsInvalidArgument());
+
+    ASSERT_OK(txn3->Rollback());
+  }
+
+  // GetEntityForUpdate with validation but no validation timestamp is not
+  // allowed
+  {
+    std::unique_ptr<Transaction> txn4(
+        NewTxn(WriteOptions(), TransactionOptions()));
+
+    // ReadOptions.timestamp is not set
+    {
+      PinnableWideColumns columns;
+      ASSERT_TRUE(txn4->GetEntityForUpdate(ReadOptions(), cfh, foo, &columns)
+                      .IsInvalidArgument());
+    }
+
+    // ReadOptions.timestamp is set
+    {
+      ReadOptions read_options;
+      std::string read_timestamp;
+      Slice read_ts = EncodeU64Ts(27, &read_timestamp);
+      read_options.timestamp = &read_ts;
+
+      PinnableWideColumns columns;
+      ASSERT_TRUE(txn4->GetEntityForUpdate(read_options, cfh, foo, &columns)
+                      .IsInvalidArgument());
+    }
+
+    ASSERT_OK(txn4->Rollback());
+  }
+
+  // Validation disabled
+  {
+    std::unique_ptr<Transaction> txn5(
+        NewTxn(WriteOptions(), TransactionOptions()));
+
+    // ReadOptions.timestamp is not set => success
+    {
+      PinnableWideColumns columns;
+      ASSERT_OK(txn5->GetEntityForUpdate(ReadOptions(), cfh, foo, &columns,
+                                         /*exclusive=*/true,
+                                         /*do_validate=*/false));
+    }
+
+    // ReadOptions.timestamp explicitly set to max timestamp => success
+    {
+      ReadOptions read_options;
+      Slice max_ts = MaxU64Ts();
+      read_options.timestamp = &max_ts;
+
+      PinnableWideColumns columns;
+      ASSERT_OK(txn5->GetEntityForUpdate(read_options, cfh, baz, &columns,
+                                         /*exclusive=*/true,
+                                         /*do_validate=*/false));
+    }
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -724,4 +881,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

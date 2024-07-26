@@ -84,6 +84,7 @@ struct ImmutableDBOptions {
   bool two_write_queues;
   bool manual_wal_flush;
   CompressionType wal_compression;
+  bool background_close_inactive_wals;
   bool atomic_flush;
   bool avoid_unnecessary_blocking_io;
   bool persist_stats_to_disk;
@@ -97,13 +98,19 @@ struct ImmutableDBOptions {
   std::string db_host_id;
   FileTypeSet checksum_handoff_file_types;
   CacheTier lowest_used_cache_tier;
-  // Convenience/Helper objects that are not part of the base DBOptions
+  std::shared_ptr<CompactionService> compaction_service;
+  bool enforce_single_del_contracts;
+  uint64_t follower_refresh_catchup_period_ms;
+  uint64_t follower_catchup_retry_count;
+  uint64_t follower_catchup_retry_wait_ms;
+
+  // Beginning convenience/helper objects that are not part of the base
+  // DBOptions
   std::shared_ptr<FileSystem> fs;
   SystemClock* clock;
   Statistics* stats;
   Logger* logger;
-  std::shared_ptr<CompactionService> compaction_service;
-  bool enforce_single_del_contracts;
+  // End of convenience/helper objects.
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;

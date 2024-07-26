@@ -457,7 +457,6 @@ Status PosixHelper::GetLogicalBlockSizeOfDirectory(const std::string& directory,
                                                    size_t* size) {
   int fd = open(directory.c_str(), O_DIRECTORY | O_RDONLY);
   if (fd == -1) {
-    close(fd);
     return Status::IOError("Cannot open directory " + directory);
   }
   *size = PosixHelper::GetLogicalBlockSizeOfFd(fd);
@@ -1441,10 +1440,12 @@ void PosixWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
 #ifdef OS_LINUX
 // Suppress Valgrind "Unimplemented functionality" error.
 #ifndef ROCKSDB_VALGRIND_RUN
+  uint64_t fcntl_hint = hint;
+
   if (hint == write_hint_) {
     return;
   }
-  if (fcntl(fd_, F_SET_RW_HINT, &hint) == 0) {
+  if (fcntl(fd_, F_SET_RW_HINT, &fcntl_hint) == 0) {
     write_hint_ = hint;
   }
 #else

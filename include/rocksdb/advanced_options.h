@@ -229,11 +229,18 @@ struct AdvancedColumnFamilyOptions {
   // if it is not explicitly set by the user.  Otherwise, the default is 0.
   int64_t max_write_buffer_size_to_maintain = 0;
 
-  // Allows thread-safe inplace updates. If this is true, there is no way to
+  // Allows thread-safe inplace updates.
+  //
+  // If this is true, there is no way to
   // achieve point-in-time consistency using snapshot or iterator (assuming
   // concurrent updates). Hence iterator and multi-get will return results
   // which are not consistent as of any point-in-time.
+  //
   // Backward iteration on memtables will not work either.
+  //
+  // It is intended to work or be compatible with a limited set of features:
+  // (1) Non-snapshot Get()
+  //
   // If inplace_callback function is not set,
   //   Put(key, new_value) will update inplace the existing_value iff
   //   * key exists in current memtable
@@ -1030,8 +1037,10 @@ struct AdvancedColumnFamilyOptions {
   // When setting this flag to `false`, users should also call
   // `DB::IncreaseFullHistoryTsLow` to set a cutoff timestamp for flush. RocksDB
   // refrains from flushing a memtable with data still above
-  // the cutoff timestamp with best effort. If this cutoff timestamp is not set,
-  // flushing continues normally.
+  // the cutoff timestamp with best effort. One limitation of this best effort
+  // is that when `max_write_buffer_number` is equal to or smaller than 2,
+  // RocksDB will not attempt to retain user-defined timestamps, all flush jobs
+  // continue normally.
   //
   // Users can do user-defined
   // multi-versioned read above the cutoff timestamp. When users try to read

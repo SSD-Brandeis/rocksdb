@@ -857,10 +857,14 @@ Version::~Version() {
       f->refs--;
       if (f->refs <= 0) {
         assert(cfd_ != nullptr);
+        // When not in the process of closing the DB, we'll have a superversion
+        // to get current mutable options from
+        auto* sv = cfd_->GetSuperVersion();
         uint32_t path_id = f->fd.GetPathId();
         assert(path_id < cfd_->ioptions()->cf_paths.size());
         vset_->obsolete_files_.emplace_back(
             f, cfd_->ioptions()->cf_paths[path_id].path,
+            sv ? sv->mutable_cf_options.uncache_aggressiveness : 0,
             cfd_->GetFileMetadataCacheReservationManager());
       }
     }
@@ -972,7 +976,8 @@ class LevelIterator final : public InternalIterator {
       const std::vector<AtomicCompactionUnitBoundary>* compaction_boundaries =
           nullptr,
       bool allow_unprepared_value = false,
-      TruncatedRangeDelIterator**** range_tombstone_iter_ptr_ = nullptr)
+      std::unique_ptr<TruncatedRangeDelIterator>*** range_tombstone_iter_ptr_ =
+          nullptr)
       : table_cache_(table_cache),
         read_options_(read_options),
         file_options_(file_options),
@@ -1112,9 +1117,8 @@ class LevelIterator final : public InternalIterator {
   }
 
   void ClearRangeTombstoneIter() {
-    if (range_tombstone_iter_ && *range_tombstone_iter_) {
-      delete *range_tombstone_iter_;
-      *range_tombstone_iter_ = nullptr;
+    if (range_tombstone_iter_) {
+      range_tombstone_iter_->reset();
     }
   }
 
@@ -1197,7 +1201,7 @@ class LevelIterator final : public InternalIterator {
   // iterator end).
   //
   // *range_tombstone_iter_ points to range tombstones of the current SST file
-  TruncatedRangeDelIterator** range_tombstone_iter_;
+  std::unique_ptr<TruncatedRangeDelIterator>* range_tombstone_iter_;
 
   // The sentinel key to be returned
   Slice sentinel_;
@@ -1276,11 +1280,9 @@ void LevelIterator::Seek(const Slice& target) {
                                           ts_sz);
       if (prefix_extractor_->InDomain(target_user_key_without_ts) &&
           (!prefix_extractor_->InDomain(next_file_first_user_key_without_ts) ||
-           user_comparator_.CompareWithoutTimestamp(
-               prefix_extractor_->Transform(target_user_key_without_ts), false,
-               prefix_extractor_->Transform(
-                   next_file_first_user_key_without_ts),
-               false) != 0)) {
+           prefix_extractor_->Transform(target_user_key_without_ts)
+                   .compare(prefix_extractor_->Transform(
+                       next_file_first_user_key_without_ts)) != 0)) {
         // SkipEmptyFileForward() will not advance to next file when this flag
         // is set for reason detailed below.
         //
@@ -1925,7 +1927,7 @@ InternalIterator* Version::TEST_GetLevelIterator(
     int level, bool allow_unprepared_value) {
   auto* arena = merge_iter_builder->GetArena();
   auto* mem = arena->AllocateAligned(sizeof(LevelIterator));
-  TruncatedRangeDelIterator*** tombstone_iter_ptr = nullptr;
+  std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr = nullptr;
   auto level_iter = new (mem) LevelIterator(
       cfd_->table_cache(), read_options, file_options_,
       cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
@@ -2025,7 +2027,7 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
     // Merge all level zero files together since they may overlap
-    TruncatedRangeDelIterator* tombstone_iter = nullptr;
+    std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto& file = storage_info_.LevelFilesBrief(0).files[i];
       auto table_iter = cfd_->table_cache()->NewIterator(
@@ -2042,8 +2044,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       if (read_options.ignore_range_deletions) {
         merge_iter_builder->AddIterator(table_iter);
       } else {
-        merge_iter_builder->AddPointAndTombstoneIterator(table_iter,
-                                                         tombstone_iter);
+        merge_iter_builder->AddPointAndTombstoneIterator(
+            table_iter, std::move(tombstone_iter));
       }
     }
     if (should_sample) {
@@ -2060,7 +2062,7 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     // walks through the non-overlapping files in the level, opening them
     // lazily.
     auto* mem = arena->AllocateAligned(sizeof(LevelIterator));
-    TruncatedRangeDelIterator*** tombstone_iter_ptr = nullptr;
+    std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr = nullptr;
     auto level_iter = new (mem) LevelIterator(
         cfd_->table_cache(), read_options, soptions,
         cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
@@ -2104,7 +2106,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
           BeforeFile(ucmp, &largest_user_key, file)) {
         continue;
       }
-      ScopedArenaIterator iter(cfd_->table_cache()->NewIterator(
+      ScopedArenaPtr<InternalIterator> iter(cfd_->table_cache()->NewIterator(
           read_options, file_options, cfd_->internal_comparator(),
           *file->file_metadata, &range_del_agg,
           mutable_cf_options_.prefix_extractor, nullptr,
@@ -2123,7 +2125,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
     auto mem = arena.AllocateAligned(sizeof(LevelIterator));
-    ScopedArenaIterator iter(new (mem) LevelIterator(
+    ScopedArenaPtr<InternalIterator> iter(new (mem) LevelIterator(
         cfd_->table_cache(), read_options, file_options,
         cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
         mutable_cf_options_.prefix_extractor, should_sample_file_read(),
@@ -2777,7 +2779,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     }
   }
 
-  if (s.ok() && !blob_ctxs.empty()) {
+  if (!blob_ctxs.empty()) {
     MultiGetBlob(read_options, keys_with_blobs_range, blob_ctxs);
   }
 
@@ -3130,6 +3132,10 @@ bool Version::MaybeInitializeFileMetaData(const ReadOptions& read_options,
   file_meta->raw_value_size = tp->raw_value_size;
   file_meta->raw_key_size = tp->raw_key_size;
   file_meta->num_range_deletions = tp->num_range_deletions;
+  // Ensure new invariants on old files
+  file_meta->num_deletions =
+      std::max(tp->num_deletions, tp->num_range_deletions);
+  file_meta->num_entries = std::max(tp->num_entries, tp->num_deletions);
   return true;
 }
 
@@ -3141,6 +3147,7 @@ void VersionStorageInfo::UpdateAccumulatedStats(FileMetaData* file_meta) {
   accumulated_file_size_ += file_meta->fd.GetFileSize();
   accumulated_raw_key_size_ += file_meta->raw_key_size;
   accumulated_raw_value_size_ += file_meta->raw_value_size;
+  assert(file_meta->num_entries >= file_meta->num_deletions);
   accumulated_num_non_deletions_ +=
       file_meta->num_entries - file_meta->num_deletions;
   accumulated_num_deletions_ += file_meta->num_deletions;
@@ -3496,6 +3503,10 @@ void VersionStorageInfo::ComputeCompactionScore(
           score = kScoreForNeedCompaction;
         }
       } else {
+        // For universal compaction, if a user configures `max_read_amp`, then
+        // the score may be a false positive signal.
+        // `level0_file_num_compaction_trigger` is used as a trigger to check
+        // if there is any compaction work to do.
         score = static_cast<double>(num_sorted_runs) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
         if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
@@ -4612,25 +4623,27 @@ uint64_t VersionStorageInfo::GetMaxEpochNumberOfFiles() const {
   return max_epoch_number;
 }
 
-void VersionStorageInfo::RecoverEpochNumbers(ColumnFamilyData* cfd) {
-  cfd->ResetNextEpochNumber();
+void VersionStorageInfo::RecoverEpochNumbers(ColumnFamilyData* cfd,
+                                             bool restart_epoch, bool force) {
+  if (restart_epoch) {
+    cfd->ResetNextEpochNumber();
 
-  bool reserve_epoch_num_for_file_ingested_behind =
-      cfd->ioptions()->allow_ingest_behind;
-  if (reserve_epoch_num_for_file_ingested_behind) {
-    uint64_t reserved_epoch_number = cfd->NewEpochNumber();
-    assert(reserved_epoch_number == kReservedEpochNumberForFileIngestedBehind);
-    ROCKS_LOG_INFO(cfd->ioptions()->info_log.get(),
-                   "[%s]CF has reserved epoch number %" PRIu64
-                   " for files ingested "
-                   "behind since `Options::allow_ingest_behind` is true",
-                   cfd->GetName().c_str(), reserved_epoch_number);
+    bool reserve_epoch_num_for_file_ingested_behind =
+        cfd->ioptions()->allow_ingest_behind;
+    if (reserve_epoch_num_for_file_ingested_behind) {
+      uint64_t reserved_epoch_number = cfd->NewEpochNumber();
+      assert(reserved_epoch_number ==
+             kReservedEpochNumberForFileIngestedBehind);
+      ROCKS_LOG_INFO(cfd->ioptions()->info_log.get(),
+                     "[%s]CF has reserved epoch number %" PRIu64
+                     " for files ingested "
+                     "behind since `Options::allow_ingest_behind` is true",
+                     cfd->GetName().c_str(), reserved_epoch_number);
+    }
   }
 
-  if (HasMissingEpochNumber()) {
-    assert(epoch_number_requirement_ == EpochNumberRequirement::kMightMissing);
-    assert(num_levels_ >= 1);
-
+  bool missing_epoch_number = HasMissingEpochNumber();
+  if (missing_epoch_number || force) {
     for (int level = num_levels_ - 1; level >= 1; --level) {
       auto& files_at_level = files_[level];
       if (files_at_level.empty()) {
@@ -4641,17 +4654,19 @@ void VersionStorageInfo::RecoverEpochNumbers(ColumnFamilyData* cfd) {
         f->epoch_number = next_epoch_number;
       }
     }
-
     for (auto file_meta_iter = files_[0].rbegin();
          file_meta_iter != files_[0].rend(); file_meta_iter++) {
       FileMetaData* f = *file_meta_iter;
       f->epoch_number = cfd->NewEpochNumber();
     }
-
-    ROCKS_LOG_WARN(cfd->ioptions()->info_log.get(),
-                   "[%s]CF's epoch numbers are inferred based on seqno",
-                   cfd->GetName().c_str());
-    epoch_number_requirement_ = EpochNumberRequirement::kMustPresent;
+    if (missing_epoch_number) {
+      assert(epoch_number_requirement_ ==
+             EpochNumberRequirement::kMightMissing);
+      ROCKS_LOG_WARN(cfd->ioptions()->info_log.get(),
+                     "[%s]CF's epoch numbers are inferred based on seqno",
+                     cfd->GetName().c_str());
+      epoch_number_requirement_ = EpochNumberRequirement::kMustPresent;
+    }
   } else {
     assert(epoch_number_requirement_ == EpochNumberRequirement::kMustPresent);
     cfd->SetNextEpochNumber(
@@ -5179,13 +5194,21 @@ Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
 }
 
 VersionSet::~VersionSet() {
-  // we need to delete column_family_set_ because its destructor depends on
-  // VersionSet
+  // Must clean up column families to make all files "obsolete"
   column_family_set_.reset();
+
   for (auto& file : obsolete_files_) {
     if (file.metadata->table_reader_handle) {
-      table_cache_->Release(file.metadata->table_reader_handle);
-      TableCache::Evict(table_cache_, file.metadata->fd.GetNumber());
+      // NOTE: DB is shutting down, so file is probably not obsolete, just
+      // no longer referenced by Versions in memory.
+      // For more context, see comment on "table_cache_->EraseUnRefEntries()"
+      // in DBImpl::CloseHelper().
+      // Using uncache_aggressiveness=0 overrides any previous marking to
+      // attempt to uncache the file's blocks (which after cleaning up
+      // column families could cause use-after-free)
+      TableCache::ReleaseObsolete(table_cache_,
+                                  file.metadata->table_reader_handle,
+                                  /*uncache_aggressiveness=*/0);
     }
     file.DeleteMetadata();
   }
@@ -5485,6 +5508,7 @@ Status VersionSet::ProcessManifestWrites(
   Status s;
   IOStatus io_s;
   IOStatus manifest_io_status;
+  std::unique_ptr<log::Writer> new_desc_log_ptr;
   {
     FileOptions opt_file_opts = fs_->OptimizeForManifestWrite(file_options_);
     mu->Unlock();
@@ -5513,6 +5537,7 @@ Status VersionSet::ProcessManifestWrites(
       }
     }
 
+    log::Writer* raw_desc_log_ptr = descriptor_log_.get();
     if (s.ok() && new_descriptor_log) {
       // This is fine because everything inside of this block is serialized --
       // only one thread can be here at the same time
@@ -5534,12 +5559,14 @@ Status VersionSet::ProcessManifestWrites(
             db_options_->listeners, nullptr,
             tmp_set.Contains(FileType::kDescriptorFile),
             tmp_set.Contains(FileType::kDescriptorFile)));
-        descriptor_log_.reset(
+        new_desc_log_ptr.reset(
             new log::Writer(std::move(file_writer), 0, false));
+        raw_desc_log_ptr = new_desc_log_ptr.get();
         s = WriteCurrentStateToManifest(write_options, curr_state,
-                                        wal_additions, descriptor_log_.get(),
-                                        io_s);
-      } else {
+                                        wal_additions, raw_desc_log_ptr, io_s);
+        assert(s == io_s);
+      }
+      if (!io_s.ok()) {
         manifest_io_status = io_s;
         s = io_s;
       }
@@ -5582,7 +5609,7 @@ Status VersionSet::ProcessManifestWrites(
         }
         ++idx;
 #endif /* !NDEBUG */
-        io_s = descriptor_log_->AddRecord(write_options, record);
+        io_s = raw_desc_log_ptr->AddRecord(write_options, record);
         if (!io_s.ok()) {
           s = io_s;
           manifest_io_status = io_s;
@@ -5592,7 +5619,7 @@ Status VersionSet::ProcessManifestWrites(
 
       if (s.ok()) {
         io_s =
-            SyncManifest(db_options_, write_options, descriptor_log_->file());
+            SyncManifest(db_options_, write_options, raw_desc_log_ptr->file());
         manifest_io_status = io_s;
         TEST_SYNC_POINT_CALLBACK(
             "VersionSet::ProcessManifestWrites:AfterSyncManifest", &io_s);
@@ -5625,7 +5652,7 @@ Status VersionSet::ProcessManifestWrites(
 
     if (s.ok()) {
       // find offset in manifest file where this version is stored.
-      new_manifest_file_size = descriptor_log_->file()->GetFileSize();
+      new_manifest_file_size = raw_desc_log_ptr->file()->GetFileSize();
     }
 
     if (first_writer.edit_list.front()->IsColumnFamilyDrop()) {
@@ -5671,6 +5698,7 @@ Status VersionSet::ProcessManifestWrites(
   // Append the old manifest file to the obsolete_manifest_ list to be deleted
   // by PurgeObsoleteFiles later.
   if (s.ok() && new_descriptor_log) {
+    descriptor_log_ = std::move(new_desc_log_ptr);
     obsolete_manifests_.emplace_back(
         DescriptorFileName("", manifest_file_number_));
   }
@@ -5740,14 +5768,11 @@ Status VersionSet::ProcessManifestWrites(
     for (auto v : versions) {
       delete v;
     }
-    if (manifest_io_status.ok()) {
-      manifest_file_number_ = pending_manifest_file_number_;
-      manifest_file_size_ = new_manifest_file_size;
-    }
     // If manifest append failed for whatever reason, the file could be
     // corrupted. So we need to force the next version update to start a
     // new manifest file.
     descriptor_log_.reset();
+    new_desc_log_ptr.reset();
     // If manifest operations failed, then we know the CURRENT file still
     // points to the original MANIFEST. Therefore, we can safely delete the
     // new MANIFEST.
@@ -5774,7 +5799,7 @@ Status VersionSet::ProcessManifestWrites(
     // a) CURRENT points to the new MANIFEST, and the new MANIFEST is present.
     // b) CURRENT points to the original MANIFEST, and the original MANIFEST
     //    also exists.
-    if (new_descriptor_log && !manifest_io_status.ok()) {
+    if (!manifest_io_status.ok() && new_descriptor_log) {
       ROCKS_LOG_INFO(db_options_->info_log,
                      "Deleting manifest %" PRIu64 " current manifest %" PRIu64
                      "\n",
@@ -6013,7 +6038,8 @@ Status VersionSet::GetCurrentManifestPath(const std::string& dbname,
 
 Status VersionSet::Recover(
     const std::vector<ColumnFamilyDescriptor>& column_families, bool read_only,
-    std::string* db_id, bool no_error_if_files_missing) {
+    std::string* db_id, bool no_error_if_files_missing, bool is_retry,
+    Status* log_status) {
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
   // Read "CURRENT" file, which contains a pointer to the current manifest
   // file
@@ -6038,8 +6064,11 @@ Status VersionSet::Recover(
     }
     manifest_file_reader.reset(new SequentialFileReader(
         std::move(manifest_file), manifest_path,
-        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
+        db_options_->log_readahead_size, io_tracer_, db_options_->listeners,
+        /*rate_limiter=*/nullptr, is_retry));
   }
+  TEST_SYNC_POINT("VersionSet::Recover:StartManifestRead");
+
   uint64_t current_manifest_file_size = 0;
   uint64_t log_number = 0;
   {
@@ -6050,8 +6079,8 @@ Status VersionSet::Recover(
                        true /* checksum */, 0 /* log_number */);
     VersionEditHandler handler(
         read_only, column_families, const_cast<VersionSet*>(this),
-        /*track_missing_files=*/false, no_error_if_files_missing, io_tracer_,
-        read_options, EpochNumberRequirement::kMightMissing);
+        /*track_found_and_missing_files=*/false, no_error_if_files_missing,
+        io_tracer_, read_options, EpochNumberRequirement::kMightMissing);
     handler.Iterate(reader, &log_read_status);
     s = handler.status();
     if (s.ok()) {
@@ -6062,6 +6091,9 @@ Status VersionSet::Recover(
     }
     if (s.ok()) {
       RecoverEpochNumbers();
+    }
+    if (log_status) {
+      *log_status = log_read_status;
     }
   }
 
@@ -7046,8 +7078,8 @@ InternalIterator* VersionSet::MakeInputIterator(
   // that will be initialized to where CompactionMergingIterator stores
   // pointer to its range tombstones. This is used by LevelIterator
   // to update pointer to range tombstones as it traverse different SST files.
-  std::vector<
-      std::pair<TruncatedRangeDelIterator*, TruncatedRangeDelIterator***>>
+  std::vector<std::pair<std::unique_ptr<TruncatedRangeDelIterator>,
+                        std::unique_ptr<TruncatedRangeDelIterator>**>>
       range_tombstones;
   size_t num = 0;
   for (size_t which = 0; which < c->num_input_levels(); which++) {
@@ -7069,7 +7101,8 @@ InternalIterator* VersionSet::MakeInputIterator(
                   *end, fmd.smallest.user_key()) < 0) {
             continue;
           }
-          TruncatedRangeDelIterator* range_tombstone_iter = nullptr;
+          std::unique_ptr<TruncatedRangeDelIterator> range_tombstone_iter =
+              nullptr;
           list[num++] = cfd->table_cache()->NewIterator(
               read_options, file_options_compactions,
               cfd->internal_comparator(), fmd, range_del_agg,
@@ -7086,11 +7119,13 @@ InternalIterator* VersionSet::MakeInputIterator(
               c->mutable_cf_options()->block_protection_bytes_per_key,
               /*range_del_read_seqno=*/nullptr,
               /*range_del_iter=*/&range_tombstone_iter);
-          range_tombstones.emplace_back(range_tombstone_iter, nullptr);
+          range_tombstones.emplace_back(std::move(range_tombstone_iter),
+                                        nullptr);
         }
       } else {
         // Create concatenating iterator for the files from this level
-        TruncatedRangeDelIterator*** tombstone_iter_ptr = nullptr;
+        std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr =
+            nullptr;
         list[num++] = new LevelIterator(
             cfd->table_cache(), read_options, file_options_compactions,
             cfd->internal_comparator(), c->input_levels(which),
@@ -7137,6 +7172,20 @@ Status VersionSet::GetMetadataForFile(uint64_t number, int* filelevel,
 }
 
 void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
+  if (!metadata) {
+    return;
+  }
+  assert(metadata);
+  size_t count = 0;
+  for (auto cfd : *column_family_set_) {
+    if (cfd->IsDropped() || !cfd->initialized()) {
+      continue;
+    }
+    for (int level = 0; level < cfd->NumberLevels(); level++) {
+      count += cfd->current()->storage_info()->LevelFiles(level).size();
+    }
+  }
+  metadata->reserve(count);
   for (auto cfd : *column_family_set_) {
     if (cfd->IsDropped() || !cfd->initialized()) {
       continue;
@@ -7409,7 +7458,8 @@ Status ReactiveVersionSet::ReadAndApply(
     InstrumentedMutex* mu,
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader,
     Status* manifest_read_status,
-    std::unordered_set<ColumnFamilyData*>* cfds_changed) {
+    std::unordered_set<ColumnFamilyData*>* cfds_changed,
+    std::vector<std::string>* files_to_delete) {
   assert(manifest_reader != nullptr);
   assert(cfds_changed != nullptr);
   mu->AssertHeld();
@@ -7425,6 +7475,9 @@ Status ReactiveVersionSet::ReadAndApply(
   s = manifest_tailer_->status();
   if (s.ok()) {
     *cfds_changed = std::move(manifest_tailer_->GetUpdatedColumnFamilies());
+  }
+  if (files_to_delete) {
+    *files_to_delete = std::move(manifest_tailer_->GetIntermediateFiles());
   }
 
   return s;

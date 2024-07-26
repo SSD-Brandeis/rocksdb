@@ -1182,6 +1182,30 @@ TEST_F(DBBlobBasicTest, GetMergeBlobWithPut) {
   ASSERT_EQ(Get("Key1"), "v1,v2,v3");
 }
 
+TEST_F(DBBlobBasicTest, GetMergeBlobFromMemoryTier) {
+  Options options = GetDefaultOptions();
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+
+  ASSERT_OK(Put(Key(0), "v1"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Merge(Key(0), "v2"));
+  ASSERT_OK(Flush());
+
+  // Regular `Get()` loads data block to cache.
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), Key(0), &value));
+  ASSERT_EQ("v1,v2", value);
+
+  // Base value blob is still uncached, so an in-memory read will fail.
+  ReadOptions read_options;
+  read_options.read_tier = kBlockCacheTier;
+  ASSERT_TRUE(db_->Get(read_options, Key(0), &value).IsIncomplete());
+}
+
 TEST_F(DBBlobBasicTest, MultiGetMergeBlobWithPut) {
   constexpr size_t num_keys = 3;
 
@@ -1525,6 +1549,57 @@ TEST_P(DBBlobBasicIOErrorMultiGetTest, MultipleBlobFiles) {
   ASSERT_OK(statuses[0]);
   ASSERT_EQ(value1, values[0]);
   ASSERT_TRUE(statuses[1].IsIOError());
+}
+
+TEST_F(DBBlobBasicTest, MultiGetFindTable_IOError) {
+  // Repro test for a specific bug where `MultiGet()` would fail to open a table
+  // in `FindTable()` and then proceed to return raw blob handles for the other
+  // keys.
+  Options options = GetDefaultOptions();
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+
+  Reopen(options);
+
+  // Force no table cache so every read will preload the SST file.
+  dbfull()->TEST_table_cache()->SetCapacity(0);
+
+  constexpr size_t num_keys = 2;
+
+  constexpr char key1[] = "key1";
+  constexpr char value1[] = "blob1";
+
+  ASSERT_OK(Put(key1, value1));
+  ASSERT_OK(Flush());
+
+  constexpr char key2[] = "key2";
+  constexpr char value2[] = "blob2";
+
+  ASSERT_OK(Put(key2, value2));
+  ASSERT_OK(Flush());
+
+  std::atomic<int> num_files_opened = 0;
+  // This test would be more realistic if we injected an `IOError` from the
+  // `FileSystem`
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::MultiGet:FindTable", [&](void* status) {
+        num_files_opened++;
+        if (num_files_opened == 2) {
+          Status* s = static_cast<Status*>(status);
+          *s = Status::IOError();
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::array<Slice, num_keys> keys{{key1, key2}};
+  std::array<PinnableSlice, num_keys> values;
+  std::array<Status, num_keys> statuses;
+  db_->MultiGet(ReadOptions(), db_->DefaultColumnFamily(), num_keys,
+                keys.data(), values.data(), statuses.data());
+
+  ASSERT_TRUE(statuses[0].IsIOError());
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(value2, values[1]);
 }
 
 namespace {

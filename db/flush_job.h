@@ -39,7 +39,6 @@
 #include "rocksdb/listener.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/transaction_log.h"
-#include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
@@ -73,7 +72,7 @@ class FlushJob {
            EventLogger* event_logger, bool measure_io_stats,
            const bool sync_output_directory, const bool write_manifest,
            Env::Priority thread_pri, const std::shared_ptr<IOTracer>& io_tracer,
-           const SeqnoToTimeMapping& seq_time_mapping,
+           std::shared_ptr<const SeqnoToTimeMapping> seqno_to_time_mapping,
            const std::string& db_id = "", const std::string& db_session_id = "",
            std::string full_history_ts_low = "",
            BlobFileCompletionCallback* blob_callback = nullptr);
@@ -144,6 +143,13 @@ class FlushJob {
   // `MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT` for details.
   void GetEffectiveCutoffUDTForPickedMemTables();
 
+  // If this column family enables tiering feature, it will find the current
+  // `preclude_last_level_min_seqno_`, and the smaller one between this and
+  // the `earliset_snapshot_` will later be announced to user property
+  // collectors. It indicates to tiering use cases which data are old enough to
+  // be placed on the last level.
+  void GetPrecludeLastLevelMinSeqno();
+
   Status MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT();
 
   const std::string& dbname_;
@@ -162,6 +168,7 @@ class FlushJob {
   InstrumentedMutex* db_mutex_;
   std::atomic<bool>* shutting_down_;
   std::vector<SequenceNumber> existing_snapshots_;
+  SequenceNumber earliest_snapshot_;
   SequenceNumber earliest_write_conflict_snapshot_;
   SnapshotChecker* snapshot_checker_;
   JobContext* job_context_;
@@ -210,14 +217,24 @@ class FlushJob {
   const std::string full_history_ts_low_;
   BlobFileCompletionCallback* blob_callback_;
 
-  // reference to the seqno_to_time_mapping_ in db_impl.h, not safe to read
-  // without db mutex
-  const SeqnoToTimeMapping& db_impl_seqno_to_time_mapping_;
-  SeqnoToTimeMapping seqno_to_time_mapping_;
+  // Shared copy of DB's seqno to time mapping stored in SuperVersion. The
+  // ownership is shared with this FlushJob when it's created.
+  // FlushJob accesses and ref counts immutable MemTables directly via
+  // `MemTableListVersion` instead of ref `SuperVersion`, so we need to give
+  // the flush job shared ownership of the mapping.
+  // Note this is only installed when seqno to time recording feature is
+  // enables, so it could be nullptr.
+  std::shared_ptr<const SeqnoToTimeMapping> seqno_to_time_mapping_;
 
   // Keeps track of the newest user-defined timestamp for this flush job if
   // `persist_user_defined_timestamps` flag is false.
   std::string cutoff_udt_;
+
+  // The current minimum seqno that compaction jobs will preclude the data from
+  // the last level. Data with seqnos larger than this or larger than
+  // `earliest_snapshot_` will be output to the penultimate level had it gone
+  // through a compaction to the last level.
+  SequenceNumber preclude_last_level_min_seqno_ = kMaxSequenceNumber;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

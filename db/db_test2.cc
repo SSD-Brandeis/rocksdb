@@ -4154,7 +4154,7 @@ TEST_F(DBTest2, LiveFilesOmitObsoleteFiles) {
   TEST_SYNC_POINT("DBTest2::LiveFilesOmitObsoleteFiles:FlushTriggered");
 
   ASSERT_OK(db_->DisableFileDeletions());
-  VectorLogPtr log_files;
+  VectorWalPtr log_files;
   ASSERT_OK(db_->GetSortedWalFiles(log_files));
   TEST_SYNC_POINT("DBTest2::LiveFilesOmitObsoleteFiles:LiveFilesCaptured");
   for (const auto& log_file : log_files) {
@@ -7807,6 +7807,27 @@ TEST_F(DBTest2, ZSTDChecksum) {
   ASSERT_TRUE(s.IsCorruption());
 }
 #endif
+
+TEST_F(DBTest2, TableCacheMissDuringReadFromBlockCacheTier) {
+  Options options = CurrentOptions();
+  options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  Reopen(options);
+
+  // Give table cache zero capacity to prevent preloading tables. That way,
+  // `kBlockCacheTier` reads will fail due to table cache misses.
+  dbfull()->TEST_table_cache()->SetCapacity(0);
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Flush());
+
+  uint64_t orig_num_file_opens = TestGetTickerCount(options, NO_FILE_OPENS);
+
+  ReadOptions non_blocking_opts;
+  non_blocking_opts.read_tier = kBlockCacheTier;
+  std::string value;
+  ASSERT_TRUE(db_->Get(non_blocking_opts, "foo", &value).IsIncomplete());
+
+  ASSERT_EQ(orig_num_file_opens, TestGetTickerCount(options, NO_FILE_OPENS));
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 

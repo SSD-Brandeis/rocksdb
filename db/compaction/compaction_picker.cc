@@ -340,8 +340,8 @@ Compaction* CompactionPicker::CompactFiles(
 #ifndef NDEBUG
   assert(input_files.size());
   // This compaction output should not overlap with a running compaction as
-  // `SanitizeCompactionInputFiles` should've checked earlier and db mutex
-  // shouldn't have been released since.
+  // `SanitizeAndConvertCompactionInputFiles` should've checked earlier and db
+  // mutex shouldn't have been released since.
   int start_level = Compaction::kInvalidLevel;
   for (const auto& in : input_files) {
     // input_files should already be sorted by level
@@ -457,9 +457,10 @@ bool CompactionPicker::IsRangeInCompaction(VersionStorageInfo* vstorage,
 // Returns false if files on parent level are currently in compaction, which
 // means that we can't compact them
 bool CompactionPicker::SetupOtherInputs(
-    const std::string& cf_name, VersionStorageInfo* vstorage,
-    CompactionInputFiles* inputs, CompactionInputFiles* output_level_inputs,
-    int* parent_index, int base_index, bool only_expand_towards_right) {
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    VersionStorageInfo* vstorage, CompactionInputFiles* inputs,
+    CompactionInputFiles* output_level_inputs, int* parent_index,
+    int base_index, bool only_expand_towards_right) {
   assert(!inputs->empty());
   assert(output_level_inputs->empty());
   const int input_level = inputs->level;
@@ -525,8 +526,15 @@ bool CompactionPicker::SetupOtherInputs(
     if (!ExpandInputsToCleanCut(cf_name, vstorage, &expanded_inputs)) {
       try_overlapping_inputs = false;
     }
+    // It helps to reduce write amp and avoid a further separate compaction
+    // to include more input level files without expanding output level files.
+    // So we apply a softer limit. We still need a limit to avoid overly large
+    // compactions and potential high space amp spikes.
+    const uint64_t limit =
+        MultiplyCheckOverflow(mutable_cf_options.max_compaction_bytes, 2.0);
     if (try_overlapping_inputs && expanded_inputs.size() > inputs->size() &&
-        !AreFilesInCompaction(expanded_inputs.files)) {
+        !AreFilesInCompaction(expanded_inputs.files) &&
+        output_level_inputs_size + expanded_inputs_size < limit) {
       InternalKey new_start, new_limit;
       GetRange(expanded_inputs, &new_start, &new_limit);
       CompactionInputFiles expanded_output_level_inputs;
@@ -548,7 +556,8 @@ bool CompactionPicker::SetupOtherInputs(
                                              base_index, nullptr);
       expanded_inputs_size = TotalFileSize(expanded_inputs.files);
       if (expanded_inputs.size() > inputs->size() &&
-          !AreFilesInCompaction(expanded_inputs.files)) {
+          !AreFilesInCompaction(expanded_inputs.files) &&
+          (output_level_inputs_size + expanded_inputs_size) < limit) {
         expand_inputs = true;
       }
     }
@@ -808,8 +817,8 @@ Compaction* CompactionPicker::CompactRange(
   output_level_inputs.level = output_level;
   if (input_level != output_level) {
     int parent_index = -1;
-    if (!SetupOtherInputs(cf_name, vstorage, &inputs, &output_level_inputs,
-                          &parent_index, -1)) {
+    if (!SetupOtherInputs(cf_name, mutable_cf_options, vstorage, &inputs,
+                          &output_level_inputs, &parent_index, -1)) {
       // manual compaction is now multi-threaded, so it can
       // happen that SetupOtherInputs fails
       // we handle it higher in RunManualCompaction
@@ -1031,19 +1040,18 @@ Status CompactionPicker::SanitizeCompactionInputFilesForAllLevels(
       }
     }
   }
-  if (RangeOverlapWithCompaction(smallestkey, largestkey, output_level)) {
-    return Status::Aborted(
-        "A running compaction is writing to the same output level in an "
-        "overlapping key range");
-  }
   return Status::OK();
 }
 
-Status CompactionPicker::SanitizeCompactionInputFiles(
+Status CompactionPicker::SanitizeAndConvertCompactionInputFiles(
     std::unordered_set<uint64_t>* input_files,
-    const ColumnFamilyMetaData& cf_meta, const int output_level) const {
+    const ColumnFamilyMetaData& cf_meta, const int output_level,
+    const VersionStorageInfo* vstorage,
+    std::vector<CompactionInputFiles>* converted_input_files) const {
   assert(static_cast<int>(cf_meta.levels.size()) - 1 ==
          cf_meta.levels[cf_meta.levels.size() - 1].level);
+  assert(converted_input_files);
+
   if (output_level >= static_cast<int>(cf_meta.levels.size())) {
     return Status::InvalidArgument(
         "Output level for column family " + cf_meta.name +
@@ -1069,7 +1077,6 @@ Status CompactionPicker::SanitizeCompactionInputFiles(
 
   Status s = SanitizeCompactionInputFilesForAllLevels(input_files, cf_meta,
                                                       output_level);
-
   if (!s.ok()) {
     return s;
   }
@@ -1110,6 +1117,22 @@ Status CompactionPicker::SanitizeCompactionInputFiles(
     }
   }
 
+  s = GetCompactionInputsFromFileNumbers(converted_input_files, input_files,
+                                         vstorage, CompactionOptions());
+  if (!s.ok()) {
+    return s;
+  }
+  assert(converted_input_files->size() > 0);
+  if (output_level != 0 &&
+      FilesRangeOverlapWithCompaction(
+          *converted_input_files, output_level,
+          Compaction::EvaluatePenultimateLevel(
+              vstorage, ioptions_, (*converted_input_files)[0].level,
+              output_level))) {
+    return Status::Aborted(
+        "A running compaction is writing to the same output level(s) in an "
+        "overlapping key range");
+  }
   return Status::OK();
 }
 

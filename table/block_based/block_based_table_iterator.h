@@ -9,6 +9,7 @@
 #pragma once
 #include <deque>
 
+#include "db/seqno_to_time_mapping.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_based_table_reader_impl.h"
 #include "table/block_based/block_prefetcher.h"
@@ -92,6 +93,28 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     return const_cast<BlockBasedTableIterator*>(this)
         ->MaterializeCurrentBlock();
   }
+
+  uint64_t write_unix_time() const override {
+    assert(Valid());
+    ParsedInternalKey pikey;
+    SequenceNumber seqno;
+    const SeqnoToTimeMapping& seqno_to_time_mapping =
+        table_->GetSeqnoToTimeMapping();
+    Status s = ParseInternalKey(key(), &pikey, /*log_err_key=*/false);
+    if (!s.ok()) {
+      return std::numeric_limits<uint64_t>::max();
+    } else if (kUnknownSeqnoBeforeAll == pikey.sequence) {
+      return kUnknownTimeBeforeAll;
+    } else if (seqno_to_time_mapping.Empty()) {
+      return std::numeric_limits<uint64_t>::max();
+    } else if (kTypeValuePreferredSeqno == pikey.type) {
+      seqno = ParsePackedValueForSeqno(value());
+    } else {
+      seqno = pikey.sequence;
+    }
+    return seqno_to_time_mapping.GetProximalTimeBeforeSeqno(seqno);
+  }
+
   Slice value() const override {
     // PrepareValue() must have been called.
     assert(!is_at_first_key_from_index_);
@@ -315,7 +338,8 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   // different blocks when readahead_size is calculated in
   // BlockCacheLookupForReadAheadSize, to avoid index_iter_ reseek,
   // block_handles_ is used.
-  std::deque<BlockHandleInfo> block_handles_;
+  // `block_handles_` is lazily constructed to save CPU when it is unused
+  std::unique_ptr<std::deque<BlockHandleInfo>> block_handles_;
 
   // During cache lookup to find readahead size, index_iter_ is iterated and it
   // can point to a different block. is_index_at_curr_block_ keeps track of
@@ -395,7 +419,11 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
                 : false);
   }
 
-  void ClearBlockHandles() { block_handles_.clear(); }
+  void ClearBlockHandles() {
+    if (block_handles_ != nullptr) {
+      block_handles_->clear();
+    }
+  }
 
   // Reset prev_block_offset_. If index_iter_ has moved ahead, it won't get
   // accurate prev_block_offset_.
@@ -403,7 +431,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
     prev_block_offset_ = std::numeric_limits<uint64_t>::max();
   }
 
-  bool DoesContainBlockHandles() { return !block_handles_.empty(); }
+  bool DoesContainBlockHandles() {
+    return block_handles_ != nullptr && !block_handles_->empty();
+  }
 
   void InitializeStartAndEndOffsets(bool read_curr_block,
                                     bool& found_first_miss_block,

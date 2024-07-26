@@ -41,7 +41,6 @@
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/checkpoint.h"
 #include "table/mock_table.h"
-#include "table/scoped_arena_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/cast_util.h"
@@ -277,16 +276,16 @@ class SpecialEnv : public EnvWrapper {
       SpecialEnv* env_;
       std::unique_ptr<WritableFile> base_;
     };
-    class WalFile : public WritableFile {
+    class SpecialWalFile : public WritableFile {
      public:
-      WalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
+      SpecialWalFile(SpecialEnv* env, std::unique_ptr<WritableFile>&& b)
           : env_(env), base_(std::move(b)) {
         env_->num_open_wal_file_.fetch_add(1);
       }
-      virtual ~WalFile() { env_->num_open_wal_file_.fetch_add(-1); }
+      virtual ~SpecialWalFile() { env_->num_open_wal_file_.fetch_add(-1); }
       Status Append(const Slice& data) override {
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:1");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:1");
 #endif
         Status s;
         if (env_->log_write_error_.load(std::memory_order_acquire)) {
@@ -300,7 +299,7 @@ class SpecialEnv : public EnvWrapper {
           s = base_->Append(data);
         }
 #if !(defined NDEBUG) || !defined(OS_WIN)
-        TEST_SYNC_POINT("SpecialEnv::WalFile::Append:2");
+        TEST_SYNC_POINT("SpecialEnv::SpecialWalFile::Append:2");
 #endif
         return s;
       }
@@ -420,7 +419,7 @@ class SpecialEnv : public EnvWrapper {
       } else if (strstr(f.c_str(), "MANIFEST") != nullptr) {
         r->reset(new ManifestFile(this, std::move(*r)));
       } else if (strstr(f.c_str(), "log") != nullptr) {
-        r->reset(new WalFile(this, std::move(*r)));
+        r->reset(new SpecialWalFile(this, std::move(*r)));
       } else {
         r->reset(new OtherFile(this, std::move(*r)));
       }
@@ -1042,6 +1041,7 @@ class DBTestBase : public testing::Test {
     kPartitionedFilterWithNewTableReaderForCompactions,
     kUniversalSubcompactions,
     kUnorderedWrite,
+    kBlockBasedTableWithBinarySearchWithFirstKeyIndex,
     // This must be the last line
     kEnd,
   };
@@ -1072,6 +1072,7 @@ class DBTestBase : public testing::Test {
     kSkipNoSeekToLast = 32,
     kSkipFIFOCompaction = 128,
     kSkipMmapReads = 256,
+    kSkipRowCache = 512,
   };
 
   const int kRangeDelSkipConfigs =
@@ -1079,7 +1080,9 @@ class DBTestBase : public testing::Test {
       kSkipPlainTable |
       // MmapReads disables the iterator pinning that RangeDelAggregator
       // requires.
-      kSkipMmapReads;
+      kSkipMmapReads |
+      // Not compatible yet.
+      kSkipRowCache;
 
   // `env_do_fsync` decides whether the special Env would do real
   // fsync for files and directories. Skipping fsync can speed up
@@ -1175,6 +1178,12 @@ class DBTestBase : public testing::Test {
 
   Status Put(int cf, const Slice& k, const Slice& v,
              WriteOptions wo = WriteOptions());
+
+  Status TimedPut(const Slice& k, const Slice& v, uint64_t write_unix_time,
+                  WriteOptions wo = WriteOptions());
+
+  Status TimedPut(int cf, const Slice& k, const Slice& v,
+                  uint64_t write_unix_time, WriteOptions wo = WriteOptions());
 
   Status Merge(const Slice& k, const Slice& v,
                WriteOptions wo = WriteOptions());

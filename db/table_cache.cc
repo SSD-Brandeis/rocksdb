@@ -163,6 +163,11 @@ Status TableCache::GetTableReader(
   return s;
 }
 
+Cache::Handle* TableCache::Lookup(Cache* cache, uint64_t file_number) {
+  Slice key = GetSliceForFileNumber(&file_number);
+  return cache->Lookup(key);
+}
+
 Status TableCache::FindTable(
     const ReadOptions& ro, const FileOptions& file_options,
     const InternalKeyComparator& internal_comparator,
@@ -225,7 +230,7 @@ InternalIterator* TableCache::NewIterator(
     const InternalKey* smallest_compaction_key,
     const InternalKey* largest_compaction_key, bool allow_unprepared_value,
     uint8_t block_protection_bytes_per_key, const SequenceNumber* read_seqno,
-    TruncatedRangeDelIterator** range_del_iter) {
+    std::unique_ptr<TruncatedRangeDelIterator>* range_del_iter) {
   PERF_TIMER_GUARD(new_table_iterator_nanos);
 
   Status s;
@@ -280,7 +285,7 @@ InternalIterator* TableCache::NewIterator(
         delete new_range_del_iter;
         *range_del_iter = nullptr;
       } else {
-        *range_del_iter = new TruncatedRangeDelIterator(
+        *range_del_iter = std::make_unique<TruncatedRangeDelIterator>(
             std::unique_ptr<FragmentedRangeTombstoneIterator>(
                 new_range_del_iter),
             &icomparator, &file_meta.smallest, &file_meta.largest);
@@ -395,7 +400,7 @@ uint64_t TableCache::CreateRowCacheKeyPrefix(const ReadOptions& options,
 
 bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
                                  size_t prefix_size, GetContext* get_context,
-                                 SequenceNumber seq_no) {
+                                 Status* read_status, SequenceNumber seq_no) {
   bool found = false;
 
   row_cache_key.TrimAppend(prefix_size, user_key.data(), user_key.size());
@@ -414,8 +419,8 @@ bool TableCache::GetFromRowCache(const Slice& user_key, IterKey& row_cache_key,
     row_cache.RegisterReleaseAsCleanup(row_handle, value_pinner);
     // If row cache hit, knowing cache key is the same to row_cache_key,
     // can use row_cache_key's seq no to construct InternalKey.
-    replayGetContextLog(*row_cache.Value(row_handle), user_key, get_context,
-                        &value_pinner, seq_no);
+    *read_status = replayGetContextLog(*row_cache.Value(row_handle), user_key,
+                                       get_context, &value_pinner, seq_no);
     RecordTick(ioptions_.stats, ROW_CACHE_HIT);
     found = true;
   } else {
@@ -440,21 +445,20 @@ Status TableCache::Get(
 
   // Check row cache if enabled.
   // Reuse row_cache_key sequence number when row cache hits.
+  Status s;
   if (ioptions_.row_cache && !get_context->NeedToReadSequence()) {
     auto user_key = ExtractUserKey(k);
     uint64_t cache_entry_seq_no =
         CreateRowCacheKeyPrefix(options, fd, k, get_context, row_cache_key);
     done = GetFromRowCache(user_key, row_cache_key, row_cache_key.Size(),
-                           get_context, cache_entry_seq_no);
+                           get_context, &s, cache_entry_seq_no);
     if (!done) {
       row_cache_entry = &row_cache_entry_buffer;
     }
   }
-  Status s;
   TableReader* t = fd.table_reader;
   TypedHandle* handle = nullptr;
-  if (!done) {
-    assert(s.ok());
+  if (s.ok() && !done) {
     if (t == nullptr) {
       s = FindTable(options, file_options_, internal_comparator, file_meta,
                     &handle, block_protection_bytes_per_key, prefix_extractor,
@@ -489,9 +493,8 @@ Status TableCache::Get(
       s = t->Get(options, k, get_context, prefix_extractor.get(), skip_filters);
       get_context->SetReplayLog(nullptr);
     } else if (options.read_tier == kBlockCacheTier && s.IsIncomplete()) {
-      // Couldn't find Table in cache but treat as kFound if no_io set
+      // Couldn't find table in cache and couldn't open it because of no_io.
       get_context->MarkKeyMayExist();
-      s = Status::OK();
       done = true;
     }
   }
@@ -729,4 +732,14 @@ uint64_t TableCache::ApproximateSize(
 
   return result;
 }
+
+void TableCache::ReleaseObsolete(Cache* cache, Cache::Handle* h,
+                                 uint32_t uncache_aggressiveness) {
+  CacheInterface typed_cache(cache);
+  TypedHandle* table_handle = reinterpret_cast<TypedHandle*>(h);
+  TableReader* table_reader = typed_cache.Value(table_handle);
+  table_reader->MarkObsolete(uncache_aggressiveness);
+  typed_cache.ReleaseAndEraseIfLastRef(table_handle);
+}
+
 }  // namespace ROCKSDB_NAMESPACE

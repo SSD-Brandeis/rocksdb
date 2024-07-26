@@ -293,6 +293,7 @@ struct BlockBasedTableBuilder::Rep {
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
+  std::string index_separator_scratch;
   PartitionedIndexBuilder* p_index_builder_ = nullptr;
 
   std::string last_key;
@@ -480,8 +481,10 @@ struct BlockBasedTableBuilder::Rep {
         compression_ctxs(tbo.compression_opts.parallel_threads),
         verify_ctxs(tbo.compression_opts.parallel_threads),
         verify_dict(),
-        state((tbo.compression_opts.max_dict_bytes > 0) ? State::kBuffered
-                                                        : State::kUnbuffered),
+        state((tbo.compression_opts.max_dict_bytes > 0 &&
+               tbo.compression_type != kNoCompression)
+                  ? State::kBuffered
+                  : State::kUnbuffered),
         use_delta_encoding_for_index_values(table_opt.format_version >= 4 &&
                                             !table_opt.block_align),
         reason(tbo.reason),
@@ -580,8 +583,10 @@ struct BlockBasedTableBuilder::Rep {
       assert(factory);
 
       std::unique_ptr<InternalTblPropColl> collector{
-          factory->CreateInternalTblPropColl(tbo.column_family_id,
-                                             tbo.level_at_creation)};
+          factory->CreateInternalTblPropColl(
+              tbo.column_family_id, tbo.level_at_creation,
+              tbo.ioptions.num_levels,
+              tbo.last_level_inclusive_max_seqno_threshold)};
       if (collector) {
         table_properties_collectors.emplace_back(std::move(collector));
       }
@@ -623,6 +628,14 @@ struct BlockBasedTableBuilder::Rep {
       } while (UNLIKELY(base_context_checksum == 0));
     } else {
       base_context_checksum = 0;
+    }
+
+    if (alignment > 0 && compression_type != kNoCompression) {
+      // With better sanitization in `CompactionPicker::CompactFiles()`, we
+      // would not need to handle this case here and could change it to an
+      // assertion instead.
+      SetStatus(Status::InvalidArgument(
+          "Enable block_align, but compression enabled"));
     }
   }
 
@@ -1037,8 +1050,8 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
         if (r->IsParallelCompressionEnabled()) {
           r->pc_rep->curr_block_keys->Clear();
         } else {
-          r->index_builder->AddIndexEntry(&r->last_key, &key,
-                                          r->pending_handle);
+          r->index_builder->AddIndexEntry(r->last_key, &key, r->pending_handle,
+                                          &r->index_separator_scratch);
         }
       }
     }
@@ -1473,14 +1486,15 @@ void BlockBasedTableBuilder::BGWorkWriteMaybeCompressedBlock() {
     ++r->props.num_data_blocks;
 
     if (block_rep->first_key_in_next_block == nullptr) {
-      r->index_builder->AddIndexEntry(&(block_rep->keys->Back()), nullptr,
-                                      r->pending_handle);
+      r->index_builder->AddIndexEntry(block_rep->keys->Back(), nullptr,
+                                      r->pending_handle,
+                                      &r->index_separator_scratch);
     } else {
       Slice first_key_in_next_block =
           Slice(*block_rep->first_key_in_next_block);
-      r->index_builder->AddIndexEntry(&(block_rep->keys->Back()),
-                                      &first_key_in_next_block,
-                                      r->pending_handle);
+      r->index_builder->AddIndexEntry(
+          block_rep->keys->Back(), &first_key_in_next_block, r->pending_handle,
+          &r->index_separator_scratch);
     }
 
     r->pc_rep->ReapBlock(block_rep);
@@ -1975,9 +1989,9 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
         Slice* first_key_in_next_block_ptr = &first_key_in_next_block;
 
         iter->SeekToLast();
-        std::string last_key = iter->key().ToString();
-        r->index_builder->AddIndexEntry(&last_key, first_key_in_next_block_ptr,
-                                        r->pending_handle);
+        r->index_builder->AddIndexEntry(
+            iter->key(), first_key_in_next_block_ptr, r->pending_handle,
+            &r->index_separator_scratch);
       }
     }
     std::swap(iter, next_block_iter);
@@ -2013,7 +2027,8 @@ Status BlockBasedTableBuilder::Finish() {
     // block, we will finish writing all index entries first.
     if (ok() && !empty_data_block) {
       r->index_builder->AddIndexEntry(
-          &r->last_key, nullptr /* no next data block */, r->pending_handle);
+          r->last_key, nullptr /* no next data block */, r->pending_handle,
+          &r->index_separator_scratch);
     }
   }
 

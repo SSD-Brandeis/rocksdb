@@ -2465,7 +2465,7 @@ TEST_F(CompactionPickerTest, IsBottommostLevelTest) {
   DeleteVersionStorage();
 }
 
-TEST_F(CompactionPickerTest, IgnoreCompactionLimitWhenAddFileFromInputLevel) {
+TEST_F(CompactionPickerTest, CompactionLimitWhenAddFileFromInputLevel) {
   mutable_cf_options_.max_bytes_for_level_base = 1000000u;
   mutable_cf_options_.max_compaction_bytes = 800000u;
   ioptions_.level_compaction_dynamic_level_bytes = false;
@@ -2473,8 +2473,10 @@ TEST_F(CompactionPickerTest, IgnoreCompactionLimitWhenAddFileFromInputLevel) {
   // A compaction should be triggered and pick file 2 and 5.
   // It pulls in other compaction input file from the input level L1
   // without pulling in more output level files.
-  // Files 1, 3, 4 will be included in the compaction.
+  // Files 1, 3, 4 are eligible.
   // File 6 is excluded since it overlaps with file 7.
+  // It can expand input level since in this case, the limit on compaction size
+  // is 2 * max_compaction_bytes.
   Add(1, 1U, "100", "150", 300000U);
   Add(1, 2U, "151", "200", 300001U, 0, 0);
   Add(1, 3U, "201", "250", 300000U, 0, 0);
@@ -2495,6 +2497,38 @@ TEST_F(CompactionPickerTest, IgnoreCompactionLimitWhenAddFileFromInputLevel) {
   ASSERT_EQ(2U, compaction->input(0, 1)->fd.GetNumber());
   ASSERT_EQ(3U, compaction->input(0, 2)->fd.GetNumber());
   ASSERT_EQ(4U, compaction->input(0, 3)->fd.GetNumber());
+  ASSERT_EQ(5U, compaction->input(1, 0)->fd.GetNumber());
+}
+
+TEST_F(CompactionPickerTest, HitCompactionLimitWhenAddFileFromInputLevel) {
+  mutable_cf_options_.max_bytes_for_level_base = 1000000u;
+  mutable_cf_options_.max_compaction_bytes = 800000u;
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  NewVersionStorage(6, kCompactionStyleLevel);
+  // A compaction should be triggered and pick file 2 and 5.
+  // It pulls in other compaction input file from the input level L1
+  // without pulling in more output level files.
+  // Files 1, 3, 4 are eligible.
+  // File 6 is excluded since it overlaps with file 7.
+  // It can not expand input level since total compaction size hit the limit
+  // 2 * max_compaction_bytes.
+  Add(1, 1U, "100", "150", 400000U);
+  Add(1, 2U, "151", "200", 400001U, 0, 0);
+  Add(1, 3U, "201", "250", 400000U, 0, 0);
+  Add(1, 4U, "251", "300", 400000U, 0, 0);
+  Add(1, 6U, "325", "400", 400000U, 0, 0);
+  Add(2, 5U, "100", "350", 1U);
+  Add(2, 7U, "375", "425", 1U);
+  UpdateVersionStorageInfo();
+
+  std::unique_ptr<Compaction> compaction(level_compaction_picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+      &log_buffer_));
+  ASSERT_TRUE(compaction.get() != nullptr);
+  ASSERT_EQ(2U, compaction->num_input_levels());
+  ASSERT_EQ(1U, compaction->num_input_files(0));
+  ASSERT_EQ(1U, compaction->num_input_files(1));
+  ASSERT_EQ(2U, compaction->input(0, 0)->fd.GetNumber());
   ASSERT_EQ(5U, compaction->input(1, 0)->fd.GetNumber());
 }
 
@@ -4293,6 +4327,118 @@ TEST_F(CompactionPickerTest, IntraL0WhenL0IsSmall) {
       ASSERT_EQ(2U, compaction->num_input_levels());
       ASSERT_EQ(1, compaction->output_level());
     }
+  }
+}
+
+TEST_F(CompactionPickerTest, UniversalMaxReadAmpLargeDB) {
+  ioptions_.compaction_style = kCompactionStyleUniversal;
+  ioptions_.num_levels = 50;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  mutable_cf_options_.compaction_options_universal.size_ratio = 10;
+  mutable_cf_options_.write_buffer_size = 256 << 20;
+  // Avoid space amp compaction
+  mutable_cf_options_.compaction_options_universal
+      .max_size_amplification_percent = 200;
+  const int kMaxRuns = 8;
+  for (int max_read_amp : {kMaxRuns, 0, -1}) {
+    SCOPED_TRACE("max_read_amp = " + std::to_string(max_read_amp));
+    if (max_read_amp == -1) {
+      mutable_cf_options_.level0_file_num_compaction_trigger = kMaxRuns;
+    } else {
+      mutable_cf_options_.level0_file_num_compaction_trigger = 4;
+    }
+    mutable_cf_options_.compaction_options_universal.max_read_amp =
+        max_read_amp;
+    UniversalCompactionPicker universal_compaction_picker(ioptions_, &icmp_);
+    uint64_t max_run_size = 20ull << 30;
+    // When max_read_amp = 0, we estimate the number of levels needed based on
+    // size_ratio and write_buffer_size. See more in
+    // UniversalCompactionBuilder::PickCompaction().
+    // With a 20GB last level, we estimate that 8 levels are needed:
+    // L0 256MB
+    // L1 256MB * 1.1 (size_ratio) = 282MB
+    // L2 (256MB + 282MB) * 1.1 = 592MB
+    // L3 1243MB
+    // L4 2610MB
+    // L5 5481MB
+    // L6 11510MB
+    // L7 24171MB > 20GB
+    for (int i = 0; i <= kMaxRuns; ++i) {
+      SCOPED_TRACE("i = " + std::to_string(i));
+      NewVersionStorage(/*num_levels=*/50, kCompactionStyleUniversal);
+      Add(/*level=*/49, /*file_number=*/10, /*smallest=*/"100",
+          /*largest=*/"200", /*file_size=*/max_run_size, /*path_id=*/0,
+          /*smallest_seq=*/0, /*largest_seq=*/0,
+          /*compensated_file_size=*/max_run_size);
+      // Besides the last sorted run, we add additional `i` sorted runs
+      // without triggering space-amp or size-amp compactions.
+      uint64_t file_size = 1 << 20;
+      for (int j = 0; j < i; ++j) {
+        Add(/*level=*/j, /*file_number=*/100 - j, /*smallest=*/"100",
+            /*largest=*/"200", /*file_size=*/file_size, /*path_id=*/0,
+            /*smallest_seq=*/100 - j, /*largest_seq=*/100 - j,
+            /*compensated_file_size=*/file_size);
+        // to avoid space-amp and size-amp compaction
+        file_size *= 2;
+      }
+      UpdateVersionStorageInfo();
+      // level0_file_num_compaction_trigger is still used as trigger to
+      // check potential compactions
+      ASSERT_EQ(
+          universal_compaction_picker.NeedsCompaction(vstorage_.get()),
+          i + 1 >= mutable_cf_options_.level0_file_num_compaction_trigger);
+      std::unique_ptr<Compaction> compaction(
+          universal_compaction_picker.PickCompaction(
+              cf_name_, mutable_cf_options_, mutable_db_options_,
+              vstorage_.get(), &log_buffer_));
+      if (i == kMaxRuns) {
+        // There are in total i + 1 > kMaxRuns sorted runs.
+        // This triggers compaction ignoring size_ratio.
+        ASSERT_NE(nullptr, compaction);
+        ASSERT_EQ(CompactionReason::kUniversalSortedRunNum,
+                  compaction->compaction_reason());
+        // First two runs are compacted
+        ASSERT_EQ(0, compaction->start_level());
+        ASSERT_EQ(1, compaction->output_level());
+        ASSERT_EQ(1U, compaction->num_input_files(0));
+        ASSERT_EQ(1U, compaction->num_input_files(1));
+      } else {
+        ASSERT_EQ(nullptr, compaction);
+      }
+    }
+  }
+}
+
+TEST_F(CompactionPickerTest, UniversalMaxReadAmpSmallDB) {
+  ioptions_.compaction_style = kCompactionStyleUniversal;
+  ioptions_.num_levels = 50;
+  mutable_cf_options_.RefreshDerivedOptions(ioptions_);
+  mutable_cf_options_.level0_file_num_compaction_trigger = 1;
+  mutable_cf_options_.compaction_options_universal.size_ratio = 10;
+  mutable_cf_options_.write_buffer_size = 256 << 20;
+  mutable_cf_options_.compaction_options_universal
+      .max_size_amplification_percent = 200;
+  const int kMaxRuns = 1;
+  for (int max_read_amp : {-1, kMaxRuns, 0}) {
+    SCOPED_TRACE("max_read_amp = " + std::to_string(max_read_amp));
+    mutable_cf_options_.compaction_options_universal.max_read_amp =
+        max_read_amp;
+    UniversalCompactionPicker universal_compaction_picker(ioptions_, &icmp_);
+    NewVersionStorage(/*num_levels=*/50, kCompactionStyleUniversal);
+    // max_run_size is much smaller than write_buffer_size,
+    // only 1 level is needed.
+    uint64_t max_run_size = 8 << 10;
+    Add(/*level=*/49, /*file_number=*/10, /*smallest=*/"100",
+        /*largest=*/"200", /*file_size=*/max_run_size, /*path_id=*/0,
+        /*smallest_seq=*/0, /*largest_seq=*/0,
+        /*compensated_file_size=*/max_run_size);
+    UpdateVersionStorageInfo();
+    ASSERT_TRUE(universal_compaction_picker.NeedsCompaction(vstorage_.get()));
+    std::unique_ptr<Compaction> compaction(
+        universal_compaction_picker.PickCompaction(
+            cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
+            &log_buffer_));
+    ASSERT_EQ(nullptr, compaction);
   }
 }
 

@@ -41,7 +41,6 @@
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/transaction_log.h"
-#include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
@@ -314,6 +313,8 @@ class CompactionJob {
   // entirely within s1 and s2, then the earlier version of k1 can be safely
   // deleted because that version is not visible in any snapshot.
   std::vector<SequenceNumber> existing_snapshots_;
+
+  SequenceNumber earliest_snapshot_;
 
   // This is the earliest snapshot that could be used for write-conflict
   // checking by a transaction.  For any user-key newer than this snapshot, we

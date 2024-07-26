@@ -1689,7 +1689,7 @@ class JniUtil {
     } else if (env_rs == JNI_EDETACHED) {
       // current thread is not attached, attempt to attach
       const jint rs_attach =
-          jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), NULL);
+          jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
       if (rs_attach == JNI_OK) {
         *attached = JNI_TRUE;
         return env;
@@ -5267,6 +5267,8 @@ class TickerTypeJni {
         return -0x52;
       case ROCKSDB_NAMESPACE::Tickers::PREFETCH_HITS:
         return -0x53;
+      case ROCKSDB_NAMESPACE::Tickers::SST_FOOTER_CORRUPTION_COUNT:
+        return -0x55;
       case ROCKSDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
         // -0x54 is the max value at this time. Since these values are exposed
         // directly to Java clients, we'll keep the value the same till the next
@@ -5722,6 +5724,8 @@ class TickerTypeJni {
         return ROCKSDB_NAMESPACE::Tickers::PREFETCH_BYTES_USEFUL;
       case -0x53:
         return ROCKSDB_NAMESPACE::Tickers::PREFETCH_HITS;
+      case -0x55:
+        return ROCKSDB_NAMESPACE::Tickers::SST_FOOTER_CORRUPTION_COUNT;
       case -0x54:
         // -0x54 is the max value at this time. Since these values are exposed
         // directly to Java clients, we'll keep the value the same till the next
@@ -7736,7 +7740,8 @@ class SstFileMetaDataJni : public JavaClass {
     }
 
     jmethodID mid = env->GetMethodID(
-        jclazz, "<init>", "(Ljava/lang/String;Ljava/lang/String;JJJ[B[BJZJJ)V");
+        jclazz, "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;JJJ[B[BJZJJ[B)V");
     if (mid == nullptr) {
       // exception thrown: NoSuchMethodException or OutOfMemoryError
       return nullptr;
@@ -7776,6 +7781,17 @@ class SstFileMetaDataJni : public JavaClass {
       return nullptr;
     }
 
+    jbyteArray jfile_checksum = ROCKSDB_NAMESPACE::JniUtil::copyBytes(
+        env, sst_file_meta_data->file_checksum);
+    if (env->ExceptionCheck()) {
+      // exception occurred creating java string
+      env->DeleteLocalRef(jfile_name);
+      env->DeleteLocalRef(jpath);
+      env->DeleteLocalRef(jsmallest_key);
+      env->DeleteLocalRef(jlargest_key);
+      return nullptr;
+    }
+
     jobject jsst_file_meta_data = env->NewObject(
         jclazz, mid, jfile_name, jpath,
         static_cast<jlong>(sst_file_meta_data->size),
@@ -7784,13 +7800,14 @@ class SstFileMetaDataJni : public JavaClass {
         jlargest_key, static_cast<jlong>(sst_file_meta_data->num_reads_sampled),
         static_cast<jboolean>(sst_file_meta_data->being_compacted),
         static_cast<jlong>(sst_file_meta_data->num_entries),
-        static_cast<jlong>(sst_file_meta_data->num_deletions));
+        static_cast<jlong>(sst_file_meta_data->num_deletions), jfile_checksum);
 
     if (env->ExceptionCheck()) {
       env->DeleteLocalRef(jfile_name);
       env->DeleteLocalRef(jpath);
       env->DeleteLocalRef(jsmallest_key);
       env->DeleteLocalRef(jlargest_key);
+      env->DeleteLocalRef(jfile_checksum);
       return nullptr;
     }
 
@@ -7799,6 +7816,7 @@ class SstFileMetaDataJni : public JavaClass {
     env->DeleteLocalRef(jpath);
     env->DeleteLocalRef(jsmallest_key);
     env->DeleteLocalRef(jlargest_key);
+    env->DeleteLocalRef(jfile_checksum);
 
     return jsst_file_meta_data;
   }

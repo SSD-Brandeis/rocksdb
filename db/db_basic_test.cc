@@ -442,6 +442,43 @@ TEST_F(DBBasicTest, PutSingleDeleteGet) {
                          kSkipMergePut));
 }
 
+TEST_F(DBBasicTest, TimedPutBasic) {
+  do {
+    Options options = CurrentOptions();
+    options.merge_operator = MergeOperators::CreateStringAppendOperator();
+    CreateAndReopenWithCF({"pikachu"}, options);
+    ASSERT_OK(TimedPut(1, "foo", "v1", /*write_unix_time=*/0));
+    // Read from memtable
+    ASSERT_EQ("v1", Get(1, "foo"));
+    ASSERT_OK(TimedPut(1, "foo", "v2.1", /*write_unix_time=*/3));
+    ASSERT_EQ("v2.1", Get(1, "foo"));
+
+    // Read from sst file
+    ASSERT_OK(db_->Flush(FlushOptions(), handles_[1]));
+    ASSERT_OK(Merge(1, "foo", "v2.2"));
+    ASSERT_EQ("v2.1,v2.2", Get(1, "foo"));
+    ASSERT_OK(Delete(1, "foo"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "foo"));
+
+    ASSERT_OK(TimedPut(1, "bar", "bv1", /*write_unix_time=*/0));
+    ASSERT_EQ("bv1", Get(1, "bar"));
+    ASSERT_OK(TimedPut(1, "baz", "bzv1", /*write_unix_time=*/0));
+    ASSERT_EQ("bzv1", Get(1, "baz"));
+    if (option_config_ != kRowCache) {
+      std::string range_del_begin = "b";
+      std::string range_del_end = "baz";
+      Slice begin_rdel = range_del_begin, end_rdel = range_del_end;
+      ASSERT_OK(
+          db_->DeleteRange(WriteOptions(), handles_[1], begin_rdel, end_rdel));
+      ASSERT_EQ("NOT_FOUND", Get(1, "bar"));
+    }
+
+    ASSERT_EQ("bzv1", Get(1, "baz"));
+    ASSERT_OK(SingleDelete(1, "baz"));
+    ASSERT_EQ("NOT_FOUND", Get(1, "baz"));
+  } while (ChangeOptions(kSkipPlainTable));
+}
+
 TEST_F(DBBasicTest, EmptyFlush) {
   // It is possible to produce empty flushes when using single deletes. Tests
   // whether empty flushes cause issues.
@@ -1378,7 +1415,7 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   int get_sv_count = 0;
   ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
           // After MultiGet refs a couple of CFs, flush all CFs so MultiGet
           // is forced to repeat the process
@@ -1478,9 +1515,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
   int retries = 0;
   bool last_try = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::LastTry", [&](void* /*arg*/) { last_try = true; });
+      "DBImpl::MultiCFSnapshot::LastTry",
+      [&](void* /*arg*/) { last_try = true; });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (last_try) {
           return;
         }
@@ -1496,10 +1534,10 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
         }
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
-      {"DBImpl::MultiGet::AfterLastTryRefSV",
+      {"DBImpl::MultiCFSnapshot::AfterLastTryRefSV",
        "DBMultiGetTestWithParam::MultiGetMultiCFMutex:BeforeCreateSV"},
       {"DBMultiGetTestWithParam::MultiGetMultiCFMutex:AfterCreateSV",
-       "DBImpl::MultiGet::BeforeLastTryUnRefSV"},
+       "DBImpl::MultiCFSnapshot::BeforeLastTryUnRefSV"},
   });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -1565,7 +1603,7 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
   int get_sv_count = 0;
   ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::MultiGet::AfterRefSV", [&](void* /*arg*/) {
+      "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
           for (int i = 0; i < 8; ++i) {
             ASSERT_OK(Flush(i));

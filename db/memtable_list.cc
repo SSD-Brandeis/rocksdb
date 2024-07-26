@@ -211,18 +211,22 @@ Status MemTableListVersion::AddRangeTombstoneIterators(
 }
 
 void MemTableListVersion::AddIterators(
-    const ReadOptions& options, std::vector<InternalIterator*>* iterator_list,
-    Arena* arena) {
+    const ReadOptions& options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+    std::vector<InternalIterator*>* iterator_list, Arena* arena) {
   for (auto& m : memlist_) {
-    iterator_list->push_back(m->NewIterator(options, arena));
+    iterator_list->push_back(
+        m->NewIterator(options, seqno_to_time_mapping, arena));
   }
 }
 
-void MemTableListVersion::AddIterators(const ReadOptions& options,
-                                       MergeIteratorBuilder* merge_iter_builder,
-                                       bool add_range_tombstone_iter) {
+void MemTableListVersion::AddIterators(
+    const ReadOptions& options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+    MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter) {
   for (auto& m : memlist_) {
-    auto mem_iter = m->NewIterator(options, merge_iter_builder->GetArena());
+    auto mem_iter = m->NewIterator(options, seqno_to_time_mapping,
+                                   merge_iter_builder->GetArena());
     if (!add_range_tombstone_iter || options.ignore_range_deletions) {
       merge_iter_builder->AddIterator(mem_iter);
     } else {
@@ -231,19 +235,19 @@ void MemTableListVersion::AddIterators(const ReadOptions& options,
       SequenceNumber read_seq = options.snapshot != nullptr
                                     ? options.snapshot->GetSequenceNumber()
                                     : kMaxSequenceNumber;
-      TruncatedRangeDelIterator* mem_tombstone_iter = nullptr;
+      std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
       auto range_del_iter = m->NewRangeTombstoneIterator(
           options, read_seq, true /* immutale_memtable */);
       if (range_del_iter == nullptr || range_del_iter->empty()) {
         delete range_del_iter;
       } else {
-        mem_tombstone_iter = new TruncatedRangeDelIterator(
+        mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
             std::unique_ptr<FragmentedRangeTombstoneIterator>(range_del_iter),
             &m->GetInternalKeyComparator(), nullptr /* smallest */,
             nullptr /* largest */);
       }
-      merge_iter_builder->AddPointAndTombstoneIterator(mem_iter,
-                                                       mem_tombstone_iter);
+      merge_iter_builder->AddPointAndTombstoneIterator(
+          mem_iter, std::move(mem_tombstone_iter));
     }
   }
 }
@@ -554,11 +558,12 @@ Status MemTableList::TryInstallMemtableFlushResults(
         batch_file_number = m->file_number_;
         if (m->edit_.GetBlobFileAdditions().empty()) {
           ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64 " started",
+                           "[%s] Level-0 commit flush result of table #%" PRIu64
+                           " started",
                            cfd->GetName().c_str(), m->file_number_);
         } else {
           ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
+                           "[%s] Level-0 commit flush result of table #%" PRIu64
                            " (+%zu blob files) started",
                            cfd->GetName().c_str(), m->file_number_,
                            m->edit_.GetBlobFileAdditions().size());
@@ -753,12 +758,12 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
       MemTable* m = current_->memlist_.back();
       if (m->edit_.GetBlobFileAdditions().empty()) {
         ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Level-0 commit table #%" PRIu64
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
                          ": memtable #%" PRIu64 " done",
                          cfd->GetName().c_str(), m->file_number_, mem_id);
       } else {
         ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Level-0 commit table #%" PRIu64
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
                          " (+%zu blob files)"
                          ": memtable #%" PRIu64 " done",
                          cfd->GetName().c_str(), m->file_number_,
